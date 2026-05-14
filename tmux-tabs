@@ -139,7 +139,6 @@ class TmuxTabs(App):
         tmux_run(["tmux", "move-pane", "-h", "-s", self._pane_id, "-t", win_index, "-d", "-b"])
         tmux_run(["tmux", "select-window", "-t", win_index])
         tmux_run(["tmux", "resize-pane", "-t", self._pane_id, "-x", width])
-        tmux_run(["tmux", "select-pane", "-t", self._pane_id])
         self._current_window = win_index
 
 
