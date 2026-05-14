@@ -30,43 +30,33 @@ from textual.reactive import reactive
 from textual.widgets import Label
 
 
-def tmux_run(cmd):
-    subprocess.run(cmd, capture_output=True)
+def tmux(*args):
+    return subprocess.run(["tmux", *args], capture_output=True, text=True).stdout.strip()
 
 
-def tmux_get(fmt, target=None):
-    cmd = ["tmux", "display-message", "-p"] + (["-t", target] if target else []) + [fmt]
-    return subprocess.run(cmd, capture_output=True, text=True).stdout.strip()
+def pane_var(pane, fmt):
+    return tmux("display-message", "-p", "-t", pane, fmt)
 
 
 def tmux_windows():
-    out = subprocess.run(
-        ["tmux", "list-windows", "-F",
-         "#{window_index}|#{window_name}|#{window_bell_flag}|#{window_flags}|#{pane_title}"],
-        capture_output=True, text=True,
-    ).stdout.strip()
-    rows = []
-    for line in out.splitlines():
-        idx, name, bell, flags, title = line.split("|", 4)
-        rows.append({"index": idx, "name": name, "bell": bell == "1",
-                     "active": "*" in flags, "last": "-" in flags, "title": title})
-    return rows
+    out = tmux("list-windows", "-F",
+               "#{window_index}|#{window_name}|#{window_bell_flag}|#{window_flags}|#{pane_title}")
+    return [
+        {"index": idx, "name": name, "bell": bell == "1",
+         "active": "*" in flags, "last": "-" in flags, "title": title}
+        for line in out.splitlines()
+        for idx, name, bell, flags, title in [line.split("|", 4)]
+    ]
 
 
 def parse_style(style):
-    s = {}
-    for part in style.split(","):
-        k, _, v = part.strip().partition("=")
-        s[k] = v if v else True
-    return s
+    return {k: v or True for k, _, v in (p.strip().partition("=") for p in style.split(","))}
 
 
 def tmux_styles():
     keys = {"normal": "window-status-style", "current": "window-status-current-style",
             "bell": "window-status-bell-style", "status": "status-style"}
-    return {name: parse_style(subprocess.run(
-        ["tmux", "show-options", "-gv", key], capture_output=True, text=True,
-    ).stdout.strip()) for name, key in keys.items()}
+    return {name: parse_style(tmux("show-options", "-gv", key)) for name, key in keys.items()}
 
 
 def style_to_css(s, base=None):
@@ -102,54 +92,57 @@ class TmuxTabs(App):
     @classmethod
     def build_css(cls):
         s = tmux_styles()
-        base_bg = s["normal"].get("bg", s["status"].get("bg", "#94cdba"))
-        base_fg = s["normal"].get("fg", s["status"].get("fg", "black"))
+        base = s["status"]
+        bg = s["normal"].get("bg", base.get("bg", "#94cdba"))
+        fg = s["normal"].get("fg", base.get("fg", "black"))
+        normal, bell, current = (style_to_css(s[k], base) for k in ("normal", "bell", "current"))
         return f"""
-    * {{ scrollbar-background: {base_bg}; scrollbar-color: {base_fg}; scrollbar-size: 0 0; }}
-    Screen {{ background: {base_bg}; color: {base_fg}; layers: base; }}
-    #windows {{ height: 1fr; overflow-y: auto; background: {base_bg}; }}
-    .window {{ padding: 0 1; height: 2; {style_to_css(s["normal"], s["status"])} }}
-    .window .dim {{ color: {base_fg}; text-style: dim; }}
-    .window:hover {{ background: {base_fg}; color: {base_bg}; }}
-    .bell {{ {style_to_css(s["bell"], s["status"])} }}
-    .bell:hover {{ {style_to_css(s["bell"], s["status"])} text-style: bold reverse; }}
-    .active {{ {style_to_css(s["current"], s["status"])} }}
-    .active:hover {{ {style_to_css(s["current"], s["status"])} }}
+    * {{ scrollbar-background: {bg}; scrollbar-color: {fg}; scrollbar-size: 0 0; }}
+    Screen {{ background: {bg}; color: {fg}; layers: base; }}
+    #windows {{ height: 1fr; overflow-y: auto; background: {bg}; align: left middle; }}
+    .window {{ padding: 0 1; height: 2; width: 100%; {normal} }}
+    .window .dim {{ color: {fg}; text-style: dim; }}
+    .window:hover {{ background: {fg}; color: {bg}; }}
+    .bell {{ {bell} }}
+    .bell:hover {{ {bell} text-style: bold reverse; }}
+    .active {{ {current} }}
+    .active:hover {{ {current} }}
     """
 
     def compose(self) -> ComposeResult:
         yield Vertical(*[WindowItem(w, self) for w in self.windows], id="windows")
 
     def on_mount(self):
-        self._pane_id = tmux_get("#{pane_id}")
-        self._current_window = tmux_get("#{window_index}")
-        tmux_run(["tmux", "select-pane", "-t", self._pane_id, "-T", "tmux-tabs"])
+        self._pane_id = os.environ["TMUX_PANE"]
+        self._current_window = pane_var(self._pane_id, "#{window_index}")
+        tmux("select-pane", "-t", self._pane_id, "-T", "tmux-tabs")
         self.windows = tmux_windows()
         self.set_interval(1.0, self.poll)
 
     def poll(self):
         self.windows = tmux_windows()
-        # If we're the only pane, the focused window was closed — move to last window
-        if tmux_get("#{window_panes}") == "1":
+        # If our window has only us, the content pane was closed — move to another window
+        if pane_var(self._pane_id, "#{window_panes}") == "1":
             target = (next((w["index"] for w in self.windows if w.get("last")), None)
                       or next((w["index"] for w in self.windows if not w["active"]), None))
             if target:
                 self.switch_to(target)
-                win_width = int(tmux_get("#{window_width}", self._pane_id))
-                width = int(tmux_get("#{pane_width}", self._pane_id))
-                if width >= win_width * 0.9:
-                    tmux_run(["tmux", "resize-pane", "-t", self._pane_id, "-x", str(win_width // 4)])
+                win_width = int(pane_var(self._pane_id, "#{window_width}"))
+                if int(pane_var(self._pane_id, "#{pane_width}")) >= win_width * 0.9:
+                    tmux("resize-pane", "-t", self._pane_id, "-x", str(win_width // 4))
             return
         active = next((w["index"] for w in self.windows if w["active"]), None)
         if active and active != self._current_window:
-            self._current_window = active
             self.switch_to(active)
 
     def switch_to(self, win_index):
-        width = tmux_get("#{pane_width}", self._pane_id)
-        tmux_run(["tmux", "move-pane", "-h", "-s", self._pane_id, "-t", win_index, "-d", "-b"])
-        tmux_run(["tmux", "select-window", "-t", win_index])
-        tmux_run(["tmux", "resize-pane", "-t", self._pane_id, "-x", width])
+        # Resolve target window's active pane (window-number target is ambiguous from client context)
+        target_pane = tmux("list-panes", "-t", win_index, "-f", "#{pane_active}", "-F", "#{pane_id}")
+        width = pane_var(self._pane_id, "#{pane_width}")
+        tmux("move-pane", "-h", "-s", self._pane_id, "-t", target_pane, "-d", "-b")
+        tmux("select-window", "-t", win_index)
+        tmux("resize-pane", "-t", self._pane_id, "-x", width)
+        tmux("select-pane", "-t", target_pane)
         self._current_window = win_index
 
 
