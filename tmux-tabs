@@ -49,7 +49,7 @@ def tmux_windows():
     for line in out.splitlines():
         idx, name, bell, flags, title = line.split("|", 4)
         rows.append({"index": idx, "name": name, "bell": bell == "1",
-                     "active": "*" in flags, "title": title})
+                     "active": "*" in flags, "last": "-" in flags, "title": title})
     return rows
 
 
@@ -129,6 +129,17 @@ class TmuxTabs(App):
 
     def poll(self):
         self.windows = tmux_windows()
+        # If we're the only pane, the focused window was closed — move to last window
+        if tmux_get("#{window_panes}") == "1":
+            target = (next((w["index"] for w in self.windows if w.get("last")), None)
+                      or next((w["index"] for w in self.windows if not w["active"]), None))
+            if target:
+                self.switch_to(target)
+                win_width = int(tmux_get("#{window_width}", self._pane_id))
+                width = int(tmux_get("#{pane_width}", self._pane_id))
+                if width >= win_width * 0.9:
+                    tmux_run(["tmux", "resize-pane", "-t", self._pane_id, "-x", str(win_width // 4)])
+            return
         active = next((w["index"] for w in self.windows if w["active"]), None)
         if active and active != self._current_window:
             self._current_window = active
