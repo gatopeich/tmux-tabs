@@ -1,0 +1,149 @@
+#!/usr/bin/env python3.12
+"""
+tmux-tabs — vertical window sidebar for tmux.
+
+Shows all tmux windows in a narrow left pane with bell highlights and terminal
+titles. Click any window to switch to it. Automatically follows focus when a
+new window is opened (e.g. via F2 in byobu).
+
+Usage:
+  Launch in a 15%-wide left split:
+    tmux split-window -hb -p 15 tmux-tabs
+
+  Recommended: bind to a key in ~/.tmux.conf:
+    bind -n F9 split-window -hb -p 15 tmux-tabs
+
+  Quit: press q inside the sidebar.
+
+Requirements:
+  pip install --user textual   (python3.12)
+
+Colors are read live from the tmux theme (window-status-style, etc.) so the
+sidebar matches your current byobu/tmux color scheme automatically.
+"""
+
+import os
+import subprocess
+from textual.app import App, ComposeResult
+from textual.containers import Vertical
+from textual.reactive import reactive
+from textual.widgets import Label
+
+
+def tmux_run(cmd):
+    subprocess.run(cmd, capture_output=True)
+
+
+def tmux_get(fmt, target=None):
+    cmd = ["tmux", "display-message", "-p"] + (["-t", target] if target else []) + [fmt]
+    return subprocess.run(cmd, capture_output=True, text=True).stdout.strip()
+
+
+def tmux_windows():
+    out = subprocess.run(
+        ["tmux", "list-windows", "-F",
+         "#{window_index}|#{window_name}|#{window_bell_flag}|#{window_flags}|#{pane_title}"],
+        capture_output=True, text=True,
+    ).stdout.strip()
+    rows = []
+    for line in out.splitlines():
+        idx, name, bell, flags, title = line.split("|", 4)
+        rows.append({"index": idx, "name": name, "bell": bell == "1",
+                     "active": "*" in flags, "title": title})
+    return rows
+
+
+def parse_style(style):
+    s = {}
+    for part in style.split(","):
+        k, _, v = part.strip().partition("=")
+        s[k] = v if v else True
+    return s
+
+
+def tmux_styles():
+    keys = {"normal": "window-status-style", "current": "window-status-current-style",
+            "bell": "window-status-bell-style", "status": "status-style"}
+    return {name: parse_style(subprocess.run(
+        ["tmux", "show-options", "-gv", key], capture_output=True, text=True,
+    ).stdout.strip()) for name, key in keys.items()}
+
+
+def style_to_css(s, base=None):
+    bg = s.get("bg", base.get("bg", "default") if base else "default")
+    fg = s.get("fg", base.get("fg", "default") if base else "default")
+    if s.get("reverse"):
+        bg, fg = fg, bg
+    bold = "\n        text-style: bold;" if s.get("bold") else ""
+    return f"background: {bg};\n        color: {fg};{bold}"
+
+
+class WindowItem(Label):
+    def __init__(self, win, app_ref):
+        self.win_index = win["index"]
+        self._app_ref = app_ref
+        icon = "🔔" if win["bell"] else ("▶" if win["active"] else " ")
+        title = win["title"].lstrip("✳").strip()
+        label = f"{icon} [b]{win['name']}[/b]\n    [dim]{title}[/dim]" if title else f"{icon} [b]{win['name']}[/b]"
+        classes = "window" + (" bell" if win["bell"] else "") + (" active" if win["active"] else "")
+        super().__init__(label, classes=classes, markup=True)
+
+    def on_click(self):
+        self._app_ref.switch_to(self.win_index)
+
+
+class TmuxTabs(App):
+    DEFAULT_CSS = ""
+    BINDINGS = [("q", "quit", "Quit")]
+    windows: reactive[list] = reactive([], recompose=True)
+    _pane_id: str = ""
+    _current_window: str = ""
+
+    @classmethod
+    def build_css(cls):
+        s = tmux_styles()
+        base_bg = s["normal"].get("bg", s["status"].get("bg", "#94cdba"))
+        base_fg = s["normal"].get("fg", s["status"].get("fg", "black"))
+        return f"""
+    * {{ scrollbar-background: {base_bg}; scrollbar-color: {base_fg}; scrollbar-size: 0 0; }}
+    Screen {{ background: {base_bg}; color: {base_fg}; layers: base; }}
+    #windows {{ height: 1fr; overflow-y: auto; background: {base_bg}; }}
+    .window {{ padding: 0 1; height: 2; {style_to_css(s["normal"], s["status"])} }}
+    .window .dim {{ color: {base_fg}; text-style: dim; }}
+    .window:hover {{ background: {base_fg}; color: {base_bg}; }}
+    .bell {{ {style_to_css(s["bell"], s["status"])} }}
+    .bell:hover {{ {style_to_css(s["bell"], s["status"])} text-style: bold reverse; }}
+    .active {{ {style_to_css(s["current"], s["status"])} }}
+    .active:hover {{ {style_to_css(s["current"], s["status"])} }}
+    """
+
+    def compose(self) -> ComposeResult:
+        yield Vertical(*[WindowItem(w, self) for w in self.windows], id="windows")
+
+    def on_mount(self):
+        self._pane_id = tmux_get("#{pane_id}")
+        self._current_window = tmux_get("#{window_index}")
+        tmux_run(["tmux", "select-pane", "-t", self._pane_id, "-T", "tmux-tabs"])
+        self.windows = tmux_windows()
+        self.set_interval(1.0, self.poll)
+
+    def poll(self):
+        self.windows = tmux_windows()
+        active = next((w["index"] for w in self.windows if w["active"]), None)
+        if active and active != self._current_window:
+            self._current_window = active
+            self.switch_to(active)
+
+    def switch_to(self, win_index):
+        width = tmux_get("#{pane_width}", self._pane_id)
+        tmux_run(["tmux", "move-pane", "-h", "-s", self._pane_id, "-t", win_index, "-d", "-b"])
+        tmux_run(["tmux", "select-window", "-t", win_index])
+        tmux_run(["tmux", "resize-pane", "-t", self._pane_id, "-x", width])
+        tmux_run(["tmux", "select-pane", "-t", self._pane_id])
+        self._current_window = win_index
+
+
+if __name__ == "__main__":
+    os.environ.setdefault("TEXTUAL_THEME", "")
+    TmuxTabs.CSS = TmuxTabs.build_css()
+    TmuxTabs().run(inline=False)
