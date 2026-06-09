@@ -142,6 +142,7 @@ class TmuxTabs(App):
         indices = os.read(self._fifo_fd, 4096).split()
         if indices and (idx := indices[-1].decode()) != self._current_window:
             self.switch_to(idx)
+            self.refresh_windows()
 
     def on_app_focus(self):
         # Gained focus means the user's pane was closed; move sidebar to another window
