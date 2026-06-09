@@ -131,17 +131,21 @@ class TmuxTabs(App):
         if os.path.exists(self._fifo_path):
             os.unlink(self._fifo_path)
         os.mkfifo(self._fifo_path)
-        # On window switch, tmux writes the newly-selected window index to the FIFO.
+        # On window switch or creation, tmux writes the relevant window index to the FIFO.
+        # window-linked covers new windows, which don't fire after-select-window.
         hook = f"run-shell -b 'echo #{{window_index}} >> {self._fifo_path}'"
         tmux("set-hook", "-g", "after-select-window", hook)
+        tmux("set-hook", "-g", "window-linked", hook)
         self._fifo_fd = os.open(self._fifo_path, os.O_RDONLY | os.O_NONBLOCK)
         asyncio.get_event_loop().add_reader(self._fifo_fd, self._on_window_switched)
 
     def _on_window_switched(self):
-        # Follow the user to whichever window they switched to (last line wins on bursts).
-        indices = os.read(self._fifo_fd, 4096).split()
-        if indices and (idx := indices[-1].decode()) != self._current_window:
-            self.switch_to(idx)
+        # A hook fired (select or new window). Follow the actually-active window, not the
+        # hook's index: a backgrounded new-window reports its index without becoming active.
+        os.read(self._fifo_fd, 4096)
+        active = tmux("display-message", "-p", "#{window_index}")
+        if active != self._current_window:
+            self.switch_to(active)
             self.refresh_windows()
 
     def on_app_focus(self):
