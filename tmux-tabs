@@ -27,13 +27,13 @@ import os
 import subprocess
 import sys
 from textual.app import App, ComposeResult
-from textual.containers import Vertical
+from textual.containers import Horizontal, Vertical
 from textual.reactive import reactive
 from textual.widgets import Label
 
 
 def tmux(*args):
-    return subprocess.run(["tmux", *args], capture_output=True, text=True, check=True).stdout.strip()
+    return subprocess.run(["tmux", *args], capture_output=True, text=True, check=False).stdout.strip()
 
 
 def pane_var(pane, fmt):
@@ -80,14 +80,30 @@ class WindowItem(Label):
         classes = "window" + (" bell" if win["bell"] else "") + (" active" if win["active"] else "")
         super().__init__(label, classes=classes, markup=True)
 
-    def on_click(self):
+    def on_mouse_down(self):
+        # MouseDown (not Click): the forwarded press arrives on the first click even when our
+        # pane is unfocused, whereas Click needs a MouseUp pair that the focus-grab click drops.
         self._app_ref.switch_to(self.win_index)
+
+
+class Button(Label):
+    """A clickable banner button that calls a named app method on mouse-down."""
+
+    def __init__(self, label, app_ref, action):
+        self._app_ref = app_ref
+        self._action = action
+        # markup=False: "[X]"/"[Y]"/"[N]" must render literally, not be parsed as Rich tags.
+        super().__init__(label, classes="btn", markup=False)
+
+    def on_mouse_down(self):
+        getattr(self._app_ref, self._action)()
 
 
 class TmuxTabs(App):
     DEFAULT_CSS = ""
     BINDINGS = [("q", "quit", "Quit")]
     windows: reactive[list] = reactive([], recompose=True)
+    confirming: reactive[bool] = reactive(False, recompose=True)
     _pane_id: str = ""
     _current_window: str = ""
     _fifo_path: str = ""
@@ -103,6 +119,10 @@ class TmuxTabs(App):
         return f"""
     * {{ scrollbar-background: {bg}; scrollbar-color: {fg}; scrollbar-size: 0 0; }}
     Screen {{ background: {bg}; color: {fg}; layers: base; }}
+    #banner {{ height: auto; width: 100%; background: {bg}; border-bottom: block yellow; }}
+    #title {{ padding: 0 1; width: 1fr; color: yellow; }}
+    .btn {{ padding: 0 1; color: yellow; }}
+    .btn:hover {{ text-style: reverse; }}
     #windows {{ height: 1fr; overflow-y: auto; background: {bg}; align: left middle; }}
     .window {{ padding: 0 1; height: 2; width: 100%; {normal} }}
     .window .dim {{ color: {fg}; text-style: dim; }}
@@ -114,7 +134,20 @@ class TmuxTabs(App):
     """
 
     def compose(self) -> ComposeResult:
+        if self.confirming:
+            banner = [Label("close?", id="title"), Button("(Y)", self, "exit"),
+                      Button("(N)", self, "cancel_close")]
+        else:
+            banner = [Label("[b]tmux-tabs[/b]", id="title", markup=True),
+                      Button("(X)", self, "ask_close")]
+        yield Horizontal(*banner, id="banner")
         yield Vertical(*[WindowItem(w, self) for w in self.windows], id="windows")
+
+    def ask_close(self):
+        self.confirming = True
+
+    def cancel_close(self):
+        self.confirming = False
 
     def on_mount(self):
         self._pane_id = os.environ["TMUX_PANE"]
@@ -123,6 +156,14 @@ class TmuxTabs(App):
         self.windows = tmux_windows()
         self._setup_fifo()
         self.set_interval(1.0, self.refresh_windows)
+
+    def on_unmount(self):
+        # Graceful quit (q or [Y]) routes through here — remove our global hooks and the FIFO
+        # so they don't linger writing to a dead pipe. An external kill won't reach this.
+        tmux("set-hook", "-gu", "after-select-window")
+        tmux("set-hook", "-gu", "window-linked")
+        if os.path.exists(self._fifo_path):
+            os.unlink(self._fifo_path)
 
     def _setup_fifo(self):
         # session_id is like "$1"; strip the $ so it can't be shell-expanded inside the hook
@@ -163,6 +204,12 @@ class TmuxTabs(App):
     def switch_to(self, win_index):
         # Resolve target window's active pane (window-number target is ambiguous from client context)
         target_pane = tmux("list-panes", "-t", win_index, "-f", "#{pane_active}", "-F", "#{pane_id}")
+        if win_index == self._current_window:
+            # Already here; moving our pane into its own window would error. Just drop focus
+            # onto the content pane so a click always gets the user out of the sidebar.
+            if target_pane != self._pane_id:
+                tmux("select-pane", "-t", target_pane)
+            return
         # Cap to a quarter of the target window: our own width is meaningless when it's a full pane.
         width = min(int(pane_var(self._pane_id, "#{pane_width}")), int(pane_var(target_pane, "#{window_width}")) // 4)
         # Join at this width in one move so the content pane never re-lays-out (no flicker).
