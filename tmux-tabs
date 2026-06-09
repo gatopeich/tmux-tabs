@@ -138,7 +138,7 @@ class TmuxTabs(App):
             banner = [Label("close?", id="title"), Button("(Y)", self, "exit"),
                       Button("(N)", self, "cancel_close")]
         else:
-            banner = [Label("[b]tmux-tabs[/b]", id="title", markup=True),
+            banner = [Label("[b]tmux-tabs by gatopeich[/b]", id="title", markup=True),
                       Button("(X)", self, "ask_close")]
         yield Horizontal(*banner, id="banner")
         yield Vertical(*[WindowItem(w, self) for w in self.windows], id="windows")
