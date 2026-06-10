@@ -7,13 +7,10 @@ titles. Click any window to switch to it. Automatically follows focus when a
 new window is opened (e.g. via F2 in byobu).
 
 Usage:
-  Launch in a 15%-wide left split:
-    tmux split-window -hb -p 15 tmux-tabs
+  Run `tmux-tabs` in any tmux pane — it splits off a 25%-wide left sidebar and
+  hands the original pane back as the content pane.
 
-  Recommended: bind to a key in ~/.tmux.conf:
-    bind -n F9 split-window -hb -p 15 tmux-tabs
-
-  Quit: press q inside the sidebar.
+  Quit: click the (X) button, or press q inside the sidebar.
 
 Requirements:
   pip install --user textual   (python3.12)
@@ -32,8 +29,9 @@ from textual.reactive import reactive
 from textual.widgets import Label
 
 
-def tmux(*args):
-    return subprocess.run(["tmux", *args], capture_output=True, text=True, check=False).stdout.strip()
+def tmux(*args, check=False):
+    """Run tmux, returning stripped stdout. check=True raises CalledProcessError on failure."""
+    return subprocess.run(["tmux", *args], capture_output=True, text=True, check=check).stdout.strip()
 
 
 def pane_var(pane, fmt):
@@ -102,12 +100,13 @@ class Button(Label):
 class TmuxTabs(App):
     DEFAULT_CSS = ""
     BINDINGS = [("q", "quit", "Quit")]
-    windows: reactive[list] = reactive([], recompose=True)
-    confirming: reactive[bool] = reactive(False, recompose=True)
-    _pane_id: str = ""
-    _current_window: str = ""
-    _fifo_path: str = ""
-    _fifo_fd: int = 0
+    windows = reactive([], recompose=True)
+    confirming = reactive(False, recompose=True)
+    _pane_id = None
+    _current_window = None
+    _selected_pane = None  # content pane beside us; bounce focus here, None when none exists
+    _fifo_path = None
+    _fifo_fd = None
 
     @classmethod
     def build_css(cls):
@@ -138,7 +137,7 @@ class TmuxTabs(App):
             banner = [Label("close?", id="title"), Button("(Y)", self, "exit"),
                       Button("(N)", self, "cancel_close")]
         else:
-            banner = [Label("[b]tmux-tabs by gatopeich[/b]", id="title", markup=True),
+            banner = [Label("[b]tmux-tabs by gus pozuelo[/b]", id="title", markup=True),
                       Button("(X)", self, "ask_close")]
         yield Horizontal(*banner, id="banner")
         yield Vertical(*[WindowItem(w, self) for w in self.windows], id="windows")
@@ -185,13 +184,20 @@ class TmuxTabs(App):
             self.refresh_windows()
 
     def on_app_focus(self):
-        # Gained focus means the user's pane was closed; move sidebar to another window
-        self.windows = tmux_windows()
-        if pane_var(self._pane_id, "#{window_panes}") == "1":
-            target = (next((w["index"] for w in self.windows if w.get("last")), None)
-                      or next((w["index"] for w in self.windows if not w["active"]), None))
-            if target:
+        # The sidebar never holds focus (buttons react on mouse-down regardless). Bounce focus
+        # back to the content pane we sit beside. If it's gone (closed) or unknown, follow to
+        # another window instead.
+        try:
+            tmux("select-pane", "-t", self._selected_pane, check=True)
+        except Exception:
+            if target := self._other_window():
                 self.switch_to(target)
+
+    def _other_window(self):
+        """Index of a window to flee to when our content pane is gone: last-active, else any other."""
+        self.windows = tmux_windows()
+        return (next((w["index"] for w in self.windows if w.get("last")), None)
+                or next((w["index"] for w in self.windows if not w["active"]), None))
 
     def refresh_windows(self):
         self.windows = tmux_windows()
@@ -199,11 +205,12 @@ class TmuxTabs(App):
     def switch_to(self, win_index):
         # Resolve target window's active pane (window-number target is ambiguous from client context)
         target_pane = tmux("list-panes", "-t", win_index, "-f", "#{pane_active}", "-F", "#{pane_id}")
+        # The content pane to bounce focus to; None if the only pane there is us.
+        self._selected_pane = target_pane if target_pane != self._pane_id else None
         if win_index == self._current_window:
-            # Already here; moving our pane into its own window would error. Just drop focus
-            # onto the content pane so a click always gets the user out of the sidebar.
-            if target_pane != self._pane_id:
-                tmux("select-pane", "-t", target_pane)
+            # Already here; moving our pane into its own window would error. Just drop focus.
+            if self._selected_pane:
+                tmux("select-pane", "-t", self._selected_pane)
             return
         # Cap to a quarter of the target window: our own width is meaningless when it's a full pane.
         width = min(int(pane_var(self._pane_id, "#{pane_width}")), int(pane_var(target_pane, "#{window_width}")) // 4)
@@ -211,6 +218,9 @@ class TmuxTabs(App):
         tmux("move-pane", "-h", "-l", str(width), "-s", self._pane_id, "-t", target_pane, "-d", "-b")
         tmux("select-window", "-t", win_index)
         tmux("select-pane", "-t", target_pane)
+        # Repaint the highlight in-memory (no tmux re-query): old window loses active, new gains it.
+        self.windows = [{**w, "active": w["index"] == win_index, "last": w["index"] == self._current_window}
+                        for w in self.windows]
         self._current_window = win_index
 
 
