@@ -120,8 +120,8 @@ class TmuxTabs(App):
     * {{ scrollbar-background: {bg}; scrollbar-color: {fg}; scrollbar-size: 0 0; }}
     Screen {{ background: {bg}; color: {fg}; layers: base; }}
     #banner {{ height: auto; width: 100%; background: {bg}; border-bottom: block yellow; }}
-    #title {{ padding: 0 1; width: 1fr; color: yellow; }}
-    .btn {{ padding: 0 1; color: yellow; }}
+    #title {{ padding: 0 1; width: 1fr; background: yellow; color: #4b0082; text-style: bold; }}
+    .btn {{ padding: 0 1; background: yellow; color: #4b0082; }}
     .btn:hover {{ text-style: reverse; }}
     #windows {{ height: 1fr; overflow-y: auto; background: {bg}; align: left middle; }}
     .window {{ padding: 0 1; height: 2; width: 100%; {normal} }}
@@ -157,15 +157,10 @@ class TmuxTabs(App):
         self._setup_fifo()
         self.set_interval(1.0, self.refresh_windows)
 
-    def on_unmount(self):
-        # Graceful quit (q or [Y]) routes through here — remove our global hooks and the FIFO
-        # so they don't linger writing to a dead pipe. An external kill won't reach this.
-        tmux("set-hook", "-gu", "after-select-window")
-        tmux("set-hook", "-gu", "window-linked")
-        if os.path.exists(self._fifo_path):
-            os.unlink(self._fifo_path)
-
     def _setup_fifo(self):
+        # No teardown on quit: the hooks are global and shared, so a dying instance must not remove
+        # them (it would break a relaunched one). We deliberately leave the FIFO in /tmp — re-created
+        # fresh on every launch below, and the OS clears /tmp in due time. See: never add on_unmount.
         # session_id is like "$1"; strip the $ so it can't be shell-expanded inside the hook
         session_id = pane_var(self._pane_id, "#{session_id}").lstrip("$")
         self._fifo_path = f"/tmp/tmux-tabs-{session_id}"
@@ -173,10 +168,10 @@ class TmuxTabs(App):
             os.unlink(self._fifo_path)
         os.mkfifo(self._fifo_path)
         # On window switch or creation, tmux writes the relevant window index to the FIFO.
-        # window-linked covers new windows, which don't fire after-select-window.
+        # after-new-window covers new windows, which don't fire after-select-window.
         hook = f"run-shell -b 'echo #{{window_index}} >> {self._fifo_path}'"
         tmux("set-hook", "-g", "after-select-window", hook)
-        tmux("set-hook", "-g", "window-linked", hook)
+        tmux("set-hook", "-g", "after-new-window", hook)
         self._fifo_fd = os.open(self._fifo_path, os.O_RDONLY | os.O_NONBLOCK)
         asyncio.get_event_loop().add_reader(self._fifo_fd, self._on_window_switched)
 
