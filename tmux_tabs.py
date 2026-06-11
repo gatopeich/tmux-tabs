@@ -10,7 +10,7 @@ Usage:
   Run `tmux-tabs` in any tmux pane — it splits off a 25%-wide left sidebar and
   hands the original pane back as the content pane.
 
-  Quit: click the (X) button, or press q inside the sidebar.
+  Quit: click the (X) button, then (Y) to confirm.
 
 Requirements:
   pip install --user textual   (python3.12)
@@ -107,7 +107,6 @@ class Button(Label):
 
 class TmuxTabs(App):
     DEFAULT_CSS = ""
-    BINDINGS = [("q", "quit", "Quit")]
     windows = reactive([], recompose=True)
     confirming = reactive(False, recompose=True)
     _busy = False           # reentrancy guard: our own select-window refires the FIFO hook
@@ -170,7 +169,7 @@ class TmuxTabs(App):
         self.refresh_windows()  # initial dump + provision placeholders for all other windows
 
     def on_unmount(self):
-        # Graceful quit (q / [Y]): we're the only instance, so tear down what we set. Remove our
+        # Graceful quit (the [Y] confirm button): we're the only instance, so tear down what we set. Remove our
         # hooks — else they keep running run-shell on every window switch for a dead sidebar — and
         # reap our placeholders. (A crash skips this; the next launch resets hooks and reaps strays.)
         tmux("set-hook", "-gu", "after-select-window")

@@ -39,7 +39,7 @@ tmux-tabs
 
 It splits off a 25%-wide sidebar on the left and hands your original pane back as the content pane.
 
-To quit: click the `(X)` button (then `(Y)` to confirm), or focus the sidebar and press `q`.
+To quit: click the `(X)` button, then `(Y)` to confirm.
 
 Optionally bind it to a key in `~/.tmux.conf`:
 
