@@ -29,6 +29,11 @@ from textual.reactive import reactive
 from textual.widgets import Label
 
 
+# Pin the sidebar width via the main-vertical layout (tmux >= 3.6). Flipped off the
+# first time select-layout main-vertical fails, after which we fall back to resize-pane.
+USE_MAIN_VERTICAL = True
+
+
 def tmux(*args, check=False):
     # Print the failing command + stderr (the client otherwise only shows a bare
     # "server exited unexpectedly"); check=True re-raises after printing.
@@ -273,12 +278,11 @@ class TmuxTabs(App):
                     if p["title"] == "(tmux-tabs)" and p["pane"] != self._pane_id}
         resize = width != self._width
         self._width = width
-        # On a width change, settle each window into main-vertical (sidebar = fixed-width left main
-        # pane, content stacks right). main-pane-width is global, so set it once; the layout then
-        # holds the width against tmux's proportional float on external terminal resizes.
-        if resize:
+        # On a width change, settle the sidebar's own window first; main-pane-width is global so set
+        # it once here (see _pin_pane for the per-window layout and the resize-pane fallback).
+        if resize and USE_MAIN_VERTICAL:
             tmux("set-window-option", "-g", "main-pane-width", str(width))
-            tmux("select-layout", "-t", current, "main-vertical")
+            self._pin_pane(current, self._pane_id, width)
         for w in self.windows:
             if w["id"] == current:
                 continue
@@ -288,9 +292,22 @@ class TmuxTabs(App):
                 tmux("kill-pane", "-t", ph)
             elif ph:
                 if resize:
-                    tmux("select-layout", "-t", w["index"], "main-vertical")
+                    self._pin_pane(w["index"], ph, width)
             else:
                 self._make_placeholder(w["index"], str(width))
+
+    def _pin_pane(self, win_index, pane, width):
+        # Pin the sidebar to a fixed width: main-vertical (sidebar = left main pane, content stacks
+        # right) holds it against tmux's proportional float on terminal resize. If main-vertical
+        # fails (older tmux), disable it for the rest of the run and resize the pane directly.
+        global USE_MAIN_VERTICAL
+        if USE_MAIN_VERTICAL:
+            try:
+                tmux("select-layout", "-t", win_index, "main-vertical", check=True)
+                return
+            except subprocess.CalledProcessError:
+                USE_MAIN_VERTICAL = False
+        tmux("resize-pane", "-t", pane, "-x", str(width))
 
     def _sidebar_width(self):
         # Our current width, clamped to [10, half the window].
