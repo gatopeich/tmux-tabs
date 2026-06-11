@@ -1,0 +1,23 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "tmux-tabs"
+version = "0.1.0"
+description = "A vertical window sidebar for tmux — like browser tabs, with bell highlights and click-to-switch."
+readme = "README.md"
+requires-python = ">=3.12"
+license = { file = "LICENSE" }
+authors = [{ name = "gatopeich" }]
+keywords = ["tmux", "textual", "tui", "sidebar", "byobu"]
+dependencies = ["textual>=6.0"]
+
+[project.urls]
+Homepage = "https://github.com/gatopeich/tmux-tabs"
+
+[project.scripts]
+tmux-tabs = "tmux_tabs:main"
+
+[tool.setuptools]
+py-modules = ["tmux_tabs"]
