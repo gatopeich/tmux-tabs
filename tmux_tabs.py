@@ -30,8 +30,16 @@ from textual.widgets import Label
 
 
 def tmux(*args, check=False):
-    """Run tmux, returning stripped stdout. check=True raises CalledProcessError on failure."""
-    return subprocess.run(["tmux", *args], capture_output=True, text=True, check=check).stdout.strip()
+    # Print the failing command + stderr (the client otherwise only shows a bare
+    # "server exited unexpectedly"); check=True re-raises after printing.
+    try:
+        return subprocess.run(["tmux", *args], capture_output=True, text=True, check=True).stdout.strip()
+    except subprocess.CalledProcessError as e:
+        print(f"tmux {' '.join(args)}: rc={e.returncode} stdout={e.stdout.strip()!r} "
+              f"stderr={e.stderr.strip()!r}", file=sys.stderr, flush=True)
+        if check:
+            raise
+        return ""
 
 
 def pane_var(pane, fmt):
@@ -93,8 +101,6 @@ class WindowItem(Label):
 
 
 class Button(Label):
-    """A clickable banner button that calls a named app method on mouse-down."""
-
     def __init__(self, label, app_ref, action):
         self._app_ref = app_ref
         self._action = action
@@ -127,7 +133,7 @@ class TmuxTabs(App):
         normal, bell, current = (style_to_css(s[k], base) for k in ("normal", "bell", "current"))
         return f"""
     * {{ scrollbar-background: {bg}; scrollbar-color: {fg}; scrollbar-size: 0 0; }}
-    Screen {{ background: {bg}; color: {fg}; layers: base; }}
+    Screen {{ background: {bg}; color: {fg}; layers: base; border-bottom: hkey black; }}
     #banner {{ height: auto; width: 100%; background: {bg}; border-bottom: block yellow; }}
     #title {{ padding: 0 1; width: 1fr; background: yellow; color: #4b0082; text-style: bold; }}
     .btn {{ padding: 0 1; background: yellow; color: #4b0082; }}
@@ -243,7 +249,6 @@ class TmuxTabs(App):
             self._busy = False
 
     def find_window(self, key, value=True):
-        """Index of the first window whose `key` flag equals `value`, or None."""
         return next((w["index"] for w in self.windows if w[key] == value), None)
 
     @staticmethod
@@ -268,6 +273,12 @@ class TmuxTabs(App):
                     if p["title"] == "(tmux-tabs)" and p["pane"] != self._pane_id}
         resize = width != self._width
         self._width = width
+        # On a width change, settle each window into main-vertical (sidebar = fixed-width left main
+        # pane, content stacks right). main-pane-width is global, so set it once; the layout then
+        # holds the width against tmux's proportional float on external terminal resizes.
+        if resize:
+            tmux("set-window-option", "-g", "main-pane-width", str(width))
+            tmux("select-layout", "-t", current, "main-vertical")
         for w in self.windows:
             if w["id"] == current:
                 continue
@@ -277,7 +288,7 @@ class TmuxTabs(App):
                 tmux("kill-pane", "-t", ph)
             elif ph:
                 if resize:
-                    tmux("resize-pane", "-t", ph, "-x", str(width))
+                    tmux("select-layout", "-t", w["index"], "main-vertical")
             else:
                 self._make_placeholder(w["index"], str(width))
 
@@ -331,7 +342,6 @@ class TmuxTabs(App):
 
 
 def main():
-    """Console entry point. Bare invocation splits off the sidebar; --sidebar runs the TUI."""
     if "--sidebar" in sys.argv:
         os.environ.setdefault("TEXTUAL_THEME", "")
         TmuxTabs.CSS = TmuxTabs.build_css()
