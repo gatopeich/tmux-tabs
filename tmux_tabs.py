@@ -51,7 +51,7 @@ def pane_var(pane, fmt):
     return tmux("display-message", "-p", "-t", pane, fmt)
 
 
-PANE_FIELDS = 10  # fields per pane in the dump below; free-text name/title kept last (newline-safe)
+PANE_FIELDS = 11  # fields per pane in the dump below; free-text name/title kept last (newline-safe)
 
 
 def tmux_panes(session):
@@ -60,13 +60,13 @@ def tmux_panes(session):
     # because window_name/pane_title are free text that can hold any delimiter (tmux collapses
     # newlines in them). Fixed groups; name and title come last.
     f = tmux("list-panes", "-s", "-t", session, "-F", "#{window_id}\n#{window_index}\n#{window_flags}\n"
-             "#{window_bell_flag}\n#{pane_id}\n#{pane_active}\n#{pane_width}\n#{window_width}\n"
+             "#{window_bell_flag}\n#{pane_id}\n#{pane_active}\n#{pane_dead}\n#{pane_width}\n#{window_width}\n"
              "#{window_name}\n#{pane_title}").splitlines()
     return [
         {"win": wid, "index": idx, "active": "*" in flags, "last": "-" in flags,
-         "bell": bell == "1", "pane": pid, "pane_active": pa == "1", "width": int(width),
-         "win_width": int(ww), "name": name, "title": title}
-        for wid, idx, flags, bell, pid, pa, width, ww, name, title in zip(*[iter(f)] * PANE_FIELDS)
+         "bell": bell == "1", "pane": pid, "pane_active": pa == "1", "pane_dead": dead == "1",
+         "width": int(width), "win_width": int(ww), "name": name, "title": title}
+        for wid, idx, flags, bell, pid, pa, dead, width, ww, name, title in zip(*[iter(f)] * PANE_FIELDS)
     ]
 
 
@@ -93,15 +93,21 @@ class WindowItem(Label):
     def __init__(self, win, app_ref):
         self.win_index = win["index"]
         self._app_ref = app_ref
-        icon = "🔔" if win["bell"] else ("▶" if win["active"] else " ")
+        icon = {"dead": "☠️", "active": "▶", "bell": "🔔"}.get(win["status"], " ")
         title = win["title"].lstrip("✳").strip()
         label = f"{icon} [b]{win['name']}[/b]\n    [dim]{title}[/dim]" if title else f"{icon} [b]{win['name']}[/b]"
-        classes = "window" + (" bell" if win["bell"] else "") + (" active" if win["active"] else "")
-        super().__init__(label, classes=classes, markup=True)
+        super().__init__(label, classes=f"window {win['status']}".strip(), markup=True)
 
     def on_mouse_down(self):
-        # MouseDown (not Click): the forwarded press arrives on the first click even when our
-        # pane is unfocused, whereas Click needs a MouseUp pair that the focus-grab click drops.
+        self._switch()
+
+    def on_mouse_up(self):
+        # React on BOTH press and release: when our pane is unfocused, tmux spends one of the two on
+        # the focus-grab, and which one it eats varies by tmux version. switch_to to the already-current
+        # window is a cheap no-op, so the surviving event drives the switch and the other does nothing.
+        self._switch()
+
+    def _switch(self):
         self._app_ref.switch_to(self.win_index)
 
 
@@ -120,7 +126,6 @@ class TmuxTabs(App):
     DEFAULT_CSS = ""
     windows = reactive([], recompose=True)
     confirming = reactive(False, recompose=True)
-    _busy = False           # reentrancy guard: our own select-window refires the FIFO hook
     _session = None         # our session id; placeholder management is scoped to it
     _pane_id = None
     _current_window = None  # window index the sidebar currently sits in
@@ -151,6 +156,8 @@ class TmuxTabs(App):
     .bell:hover {{ {bell} text-style: bold reverse; }}
     .active {{ {current} }}
     .active:hover {{ {current} }}
+    .dead {{ background: grey; color: {fg}; }}
+    .dead .dim {{ color: {fg}; }}
     """
 
     def compose(self) -> ComposeResult:
@@ -183,8 +190,8 @@ class TmuxTabs(App):
         # Graceful quit (the [Y] confirm button): we're the only instance, so tear down what we set. Remove our
         # hooks — else they keep running run-shell on every window switch for a dead sidebar — and
         # reap our placeholders. (A crash skips this; the next launch resets hooks and reaps strays.)
-        tmux("set-hook", "-gu", "after-select-window")
-        tmux("set-hook", "-gu", "after-new-window")
+        for event in ("after-select-window", "after-new-window", "pane-focus-in"):
+            tmux("set-hook", "-gu", event)
         f = tmux("list-panes", "-s", "-t", self._session, "-F", "#{pane_id}\n#{pane_title}").splitlines()
         for pid, title in zip(f[::2], f[1::2]):
             if title == "(tmux-tabs)" and pid != self._pane_id:
@@ -200,13 +207,14 @@ class TmuxTabs(App):
         if os.path.exists(self._fifo_path):
             os.unlink(self._fifo_path)
         os.mkfifo(self._fifo_path)
-        # Poke the FIFO so the reader re-dumps on user-driven window changes. Only window-level hooks
-        # that our OWN pane ops can't trigger — pane-level hooks would recurse off our split/swap/
-        # kill. Other changes (title/bell/resize) are caught by the poll. `echo 1<>fifo` (read-write
-        # redirect) so the write never blocks when no reader is attached — the hook is global and
-        # outlives us, so a stale FIFO must not hang.
+        # Poke the FIFO so the reader re-dumps on user-driven changes. pane-focus-in catches focus
+        # moves WITHIN a window (between content panes, or onto a native bar-clicked window) that
+        # after-select-window misses; it also fires as an echo of our own swap/select, but that's
+        # harmless now — refresh_windows is idempotent and filters the echo as "same window, no switch".
+        # `echo 1<>fifo` (read-write redirect) so the write never blocks when no reader is attached —
+        # the hook is global and outlives us, so a stale FIFO must not hang.
         hook = f"run-shell -b 'echo 1<>{self._fifo_path}'"
-        for event in ("after-select-window", "after-new-window"):
+        for event in ("after-select-window", "after-new-window", "pane-focus-in"):
             tmux("set-hook", "-g", event, hook)
         # O_RDWR (not O_RDONLY): keep a write-end open ourselves so the FIFO never reaches EOF when
         # the hook's writer exits — an EOF read-end makes add_reader fire nonstop (a busy-loop).
@@ -214,44 +222,44 @@ class TmuxTabs(App):
         asyncio.get_event_loop().add_reader(self._fifo_fd, self._on_event)
 
     def _on_event(self):
-        # A watched hook fired; drain the FIFO and re-dump. (switch_to follows the active window.)
+        # A watched hook fired; drain the FIFO (one line per event) and re-dump.
         os.read(self._fifo_fd, 4096)
         self.refresh_windows()
 
     def on_app_focus(self):
-        # The sidebar never holds focus (buttons react on mouse-down regardless). A refresh re-reads
-        # state and flees if we ended up alone; otherwise bounce focus back to our content pane.
-        self.refresh_windows()
-        if self._selected_pane and self._current_window in {w["index"] for w in self.windows}:
+        # Focus landed on the sidebar (the Textual app gained focus) — bounce it straight to our
+        # content pane. The sidebar must never hold focus. One cheap select-pane, no dump: the storm
+        # of focus events a native bar-click fires would otherwise each pay a full refresh.
+        if self._selected_pane:
             tmux("select-pane", "-t", self._selected_pane)
 
     def refresh_windows(self):
-        # ONE tmux read for the whole refresh: dump every pane, then derive everything in Python.
-        # Reentrancy guard: our own select-window/swap inside switch_to refires hooks → _on_event →
-        # back here; without this it recurses and piles up placeholders.
-        if self._busy:
+        # ONE tmux read for the whole refresh: dump every pane, derive everything in Python, then act
+        # on where focus actually landed. No re-entrancy guard needed: asyncio reader callbacks run to
+        # completion one at a time, so our own select-window/swap echo arrives only AFTER this returns —
+        # by which point _current_window is updated and the echo is filtered as "the window we're on".
+        panes = tmux_panes(self._session)
+        self.windows = self._windows_from(panes)
+        mine = next((p for p in panes if p["pane"] == self._pane_id), None)
+        if not mine:
             return
-        self._busy = True
-        try:
-            panes = tmux_panes(self._session)
-            self.windows = self._windows_from(panes)
-            mine = next((p for p in panes if p["pane"] == self._pane_id), None)
-            if not mine:
-                return
-            # Follow OUR session's active window, taken from the dump (a bare display-message has no
-            # client context and returns some other session's window → endless switch_to spin).
-            active = self.find_window("active")
-            if active and active != self._current_window:
-                self.switch_to(active)
-                return  # switch_to changed the layout; next event/poll re-dumps cleanly
-            # Full window width means our content pane was closed and we're alone — flee.
-            if mine["width"] == mine["win_width"]:
-                if target := self.find_window("last") or self.find_window("active", False):
-                    self.switch_to(target)
-                return
-            self._sync_placeholders(panes, max(10, min(mine["width"], mine["win_width"] // 2)), mine["win"])
-        finally:
-            self._busy = False
+        # Follow the active window of our session (the dump's active flag; a bare display-message has
+        # no client context and would return some other session's window).
+        active_win = self.find_window("active")
+        if active_win and active_win != self._current_window:
+            self.switch_to(active_win)  # genuine switch to another window
+            return  # switch_to changed the layout; next event/poll re-dumps cleanly
+        # Same window, no switch. Track our window's active content pane as the bounce target, so a
+        # focus change BETWEEN content panes (which never calls switch_to) keeps _selected_pane fresh
+        # for on_app_focus. Title-following is already handled by the recompose above.
+        self._selected_pane = next((p["pane"] for p in panes if p["win"] == mine["win"]
+                                    and p["pane_active"] and p["pane"] != self._pane_id), None)
+        # Full window width means our content pane was closed and we're alone — flee.
+        if mine["width"] == mine["win_width"]:
+            if target := self.find_window("last") or self.find_window("active", False):
+                self.switch_to(target)
+            return
+        self._sync_placeholders(panes, max(10, min(mine["width"], mine["win_width"] // 2)), mine["win"])
 
     def find_window(self, key, value=True):
         return next((w["index"] for w in self.windows if w[key] == value), None)
@@ -259,14 +267,30 @@ class TmuxTabs(App):
     @staticmethod
     def _windows_from(panes):
         # Aggregate the flat pane dump into one row per window. Title is the active CONTENT pane's
-        # (not our "(tmux-tabs)" sidebar/placeholder); panes is the count, used to detect orphans.
+        # (not our "(tmux-tabs)" sidebar/placeholder); content_panes counts live (non-dead)
+        # non-placeholder panes — zero means dead. total_panes counts every pane, so the reaper can
+        # tell a lone placeholder (reap) from a placeholder beside a dead zombie pane (keep, show ☠️).
         windows = {}
         for p in panes:
-            w = windows.setdefault(p["win"], {"id": p["win"], "index": p["index"], "name": p["name"],
-                "bell": p["bell"], "active": p["active"], "last": p["last"], "panes": 0, "title": ""})
-            w["panes"] += 1
-            if p["pane_active"] and p["title"] != "(tmux-tabs)":
-                w["title"] = p["title"]
+            if (w := windows.get(p["win"])) is None:  # first pane of this window — initialize the row
+                w = windows[p["win"]] = {"id": p["win"], "index": p["index"], "name": p["name"],
+                    "bell": p["bell"], "active": p["active"], "last": p["last"],
+                    "content_panes": 0, "total_panes": 0, "title": ""}
+            w["total_panes"] += 1
+            if p["title"] != "(tmux-tabs)":  # every content pane — accumulate
+                if not p["pane_dead"]:
+                    w["content_panes"] += 1
+                if p["pane_active"]:
+                    w["title"] = p["title"]
+        for w in windows.values():
+            if not w["content_panes"]:
+                w["status"] = "dead"
+            elif w["active"]:
+                w["status"] = "active"
+            elif w["bell"]:
+                w["status"] = "bell"
+            else:
+                w["status"] = ""
         return list(windows.values())
 
     def _sync_placeholders(self, panes, width, current):
@@ -274,7 +298,7 @@ class TmuxTabs(App):
         # sidebar's slot, so content panes keep a constant width whether the sidebar or a placeholder
         # sits beside them. Existing placeholders are read straight from the dump (a "(tmux-tabs)"
         # pane that isn't us) — no hand-maintained dict to drift after swaps.
-        existing = {p["win"]: p["pane"] for p in panes
+        existing = {p["win"]: p for p in panes
                     if p["title"] == "(tmux-tabs)" and p["pane"] != self._pane_id}
         resize = width != self._width
         self._width = width
@@ -287,12 +311,16 @@ class TmuxTabs(App):
             if w["id"] == current:
                 continue
             ph = existing.get(w["id"])
-            if ph and w["panes"] == 1:
+            if ph and w["total_panes"] == 1:
                 # Reap: our placeholder is the SOLE pane (content all gone) — let the window close.
-                tmux("kill-pane", "-t", ph)
+                # A dead zombie pane still counts, so those windows survive to show ☠️.
+                tmux("kill-pane", "-t", ph["pane"])
             elif ph:
-                if resize:
-                    self._pin_pane(w["index"], ph, width)
+                # Re-pin any placeholder whose actual width drifted from target — not just on global
+                # resize. Placeholders made during switch_to (or before main-pane-width settled) can
+                # be stuck at a stale width; the dump already carries each one's width, so this is free.
+                if width != ph["width"]:
+                    self._pin_pane(w["index"], ph["pane"], width)
             else:
                 self._make_placeholder(w["index"], str(width))
 
