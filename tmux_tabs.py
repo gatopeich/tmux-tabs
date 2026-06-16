@@ -105,11 +105,6 @@ class Button(Label):
         event.stop()
         getattr(self._app_ref, self._action)(*self._args)
 
-    def on_mouse_up(self, event):
-        # Also stop the release: WindowItem reacts on mouse-up too, so without this a button click
-        # would still bubble up and switch to the window.
-        event.stop()
-
 
 class WindowItem(Horizontal):
     # A window row: a clickable text label that switches to the window, plus an (X) close button that
@@ -141,12 +136,6 @@ class WindowItem(Horizontal):
         self.set_timer(1.0, hide_when_mouse_gone)
 
     def on_mouse_down(self):
-        self._app_ref.switch_to(self.win_index)
-
-    def on_mouse_up(self):
-        # React on BOTH press and release: when our pane is unfocused, tmux spends one of the two on
-        # the focus-grab, and which one it eats varies by tmux version. switch_to to the already-current
-        # window is a cheap no-op, so the surviving event drives the switch and the other does nothing.
         self._app_ref.switch_to(self.win_index)
 
 
