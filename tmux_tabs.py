@@ -157,7 +157,6 @@ class ModalPrompt(Widget):
     DEFAULT_CSS = """
     ModalPrompt {
         layer: overlay;
-        border: solid yellow;
         background: #4b0082;
         color: yellow;
         text-style: bold;
@@ -188,7 +187,7 @@ class ModalPrompt(Widget):
 
 class TmuxTabs(App):
     DEFAULT_CSS = ""
-    windows = reactive({}, recompose=True)  # {window_id: window dict}, see _windows_from
+    windows = reactive({}, recompose=True)  # {window_index: window dict}, see _windows_from
     # Confirm target: _APP_CLOSE to close the app, a window index to close a tab, None = no modal.
     confirming_close = reactive(None)
     _session = None         # our session id; placeholder management is scoped to it
@@ -196,7 +195,6 @@ class TmuxTabs(App):
     _current_window = None  # window index the sidebar currently sits in
     _selected_pane = None   # content pane beside us; bounce focus here, None when none exists
     _width = None           # width placeholders were last sized to; skip resize when unchanged
-    _fifo_path = None
     _fifo_fd = None
 
     @classmethod
@@ -303,22 +301,22 @@ class TmuxTabs(App):
         # fresh on every launch below, and the OS clears /tmp in due time. See: never add on_unmount.
         # session_id is like "$1"; strip the $ so it can't be shell-expanded inside the hook
         session_id = pane_var(self._pane_id, "#{session_id}").lstrip("$")
-        self._fifo_path = f"/tmp/tmux-tabs-{session_id}"
-        if os.path.exists(self._fifo_path):
-            os.unlink(self._fifo_path)
-        os.mkfifo(self._fifo_path)
+        fifo_path = f"/tmp/tmux-tabs-{session_id}"
+        if os.path.exists(fifo_path):
+            os.unlink(fifo_path)
+        os.mkfifo(fifo_path)
         # Poke the FIFO so the reader re-dumps on user-driven changes. pane-focus-in catches focus
         # moves WITHIN a window (between content panes, or onto a native bar-clicked window) that
         # after-select-window misses; it also fires as an echo of our own swap/select, but that's
         # harmless now — refresh_windows is idempotent and filters the echo as "same window, no switch".
         # `echo 1<>fifo` (read-write redirect) so the write never blocks when no reader is attached —
         # the hook is global and outlives us, so a stale FIFO must not hang.
-        hook = f"run-shell -b 'echo 1<>{self._fifo_path}'"
+        hook = f"run-shell -b 'echo 1<>{fifo_path}'"
         for event in ("after-select-window", "after-new-window", "pane-focus-in"):
             tmux("set-hook", "-g", event, hook)
         # O_RDWR (not O_RDONLY): keep a write-end open ourselves so the FIFO never reaches EOF when
         # the hook's writer exits — an EOF read-end makes add_reader fire nonstop (a busy-loop).
-        self._fifo_fd = os.open(self._fifo_path, os.O_RDWR | os.O_NONBLOCK)
+        self._fifo_fd = os.open(fifo_path, os.O_RDWR | os.O_NONBLOCK)
         asyncio.get_event_loop().add_reader(self._fifo_fd, self._on_event)
 
     def _on_event(self):
@@ -443,7 +441,7 @@ class TmuxTabs(App):
     def _make_placeholder(self, win_index, width):
         # A thin left pane running bare `cat` (minimal no-op process). Titled "(tmux-tabs)" like the
         # sidebar itself, so a fresh bare launch reaps any leftover sidebar+placeholders in one sweep
-        # before splitting. The dict is the source of truth for which pane is which during a run.
+        # before splitting.
         content = tmux("list-panes", "-t", win_index, "-f", "#{pane_active}", "-F", "#{pane_id}")
         # -f: span the full window height on the left edge, so a multi-pane window still gets the
         # placeholder as a single leftmost column (not split off just one content pane).
