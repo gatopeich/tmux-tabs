@@ -26,12 +26,14 @@ import sys
 from textual.app import App, ComposeResult
 from textual.containers import Horizontal, Vertical
 from textual.reactive import reactive
+from textual.widget import Widget
 from textual.widgets import Label
 
 
 # Pin the sidebar width via the main-vertical layout (tmux >= 3.6). Flipped off the
 # first time select-layout main-vertical fails, after which we fall back to resize-pane.
 USE_MAIN_VERTICAL = True
+_APP_CLOSE = object()  # sentinel: confirming_close == _APP_CLOSE means close the app, not a tab
 
 
 def tmux(*args, check=False):
@@ -89,43 +91,106 @@ def style_to_css(s, base=None):
     return f"background: {bg};\n        color: {fg};{bold}"
 
 
-class WindowItem(Label):
+class Button(Label):
+    def __init__(self, label, app_ref, action, *args, classes="btn"):
+        self._app_ref = app_ref
+        self._action = action
+        self._args = args
+        # markup=False: "[X]"/"[Y]"/"[N]" must render literally, not be parsed as Rich tags.
+        super().__init__(label, classes=classes, markup=False)
+
+    def on_mouse_down(self, event):
+        # Stop the press bubbling to the enclosing WindowItem, whose own on_mouse_down would otherwise
+        # switch to the window when the user only meant to click this button.
+        event.stop()
+        getattr(self._app_ref, self._action)(*self._args)
+
+    def on_mouse_up(self, event):
+        # Also stop the release: WindowItem reacts on mouse-up too, so without this a button click
+        # would still bubble up and switch to the window.
+        event.stop()
+
+
+class WindowItem(Horizontal):
+    # A window row: a clickable text label that switches to the window, plus an (X) close button that
+    # appears on hover and hides 1s after the mouse leaves the row (Textual's :hover can stick when the
+    # mouse jumps to another tmux pane, so we drive visibility from on_enter + a self-rescheduling timer).
     def __init__(self, win, app_ref):
         self.win_index = win["index"]
         self._app_ref = app_ref
         icon = {"dead": "☠️", "active": "▶", "bell": "🔔"}.get(win["status"], " ")
         title = win["title"].lstrip("✳").strip()
-        label = f"{icon} [b]{win['name']}[/b]\n    [dim]{title}[/dim]" if title else f"{icon} [b]{win['name']}[/b]"
-        super().__init__(label, classes=f"window {win['status']}".strip(), markup=True)
+        self._label = (f"{icon} [b]{win['name']}[/b]\n    [dim]{title}[/dim]" if title
+                       else f"{icon} [b]{win['name']}[/b]")
+        super().__init__(classes=f"window {win['status']}".strip())
+
+    def compose(self) -> ComposeResult:
+        yield Label(self._label, classes="window-text", markup=True)
+        yield Button("(X)", self._app_ref, "ask_close_window", self.win_index, classes="row-x")
+
+    def on_enter(self):
+        x = self.query_one(".row-x")
+        x.display = True
+        def hide_when_mouse_gone():
+            if not self.is_attached:
+                return
+            if self.region.contains(*self.app.mouse_position):
+                self.set_timer(1.0, hide_when_mouse_gone)  # still hovered — check again
+            else:
+                x.display = False
+        self.set_timer(1.0, hide_when_mouse_gone)
 
     def on_mouse_down(self):
-        self._switch()
+        self._app_ref.switch_to(self.win_index)
 
     def on_mouse_up(self):
         # React on BOTH press and release: when our pane is unfocused, tmux spends one of the two on
         # the focus-grab, and which one it eats varies by tmux version. switch_to to the already-current
         # window is a cheap no-op, so the surviving event drives the switch and the other does nothing.
-        self._switch()
-
-    def _switch(self):
         self._app_ref.switch_to(self.win_index)
 
 
-class Button(Label):
-    def __init__(self, label, app_ref, action):
-        self._app_ref = app_ref
-        self._action = action
-        # markup=False: "[X]"/"[Y]"/"[N]" must render literally, not be parsed as Rich tags.
-        super().__init__(label, classes="btn", markup=False)
+class ModalPrompt(Widget):
+    # Floating overlay: a prompt phrase above a row of labeled buttons, mounted over the widget it
+    # confirms. callback(response) gets the clicked button's bare label (e.g. "Y"); an outside click
+    # is handled by the app, not here.
+    DEFAULT_CSS = """
+    ModalPrompt {
+        layer: overlay;
+        border: solid yellow;
+        background: #4b0082;
+        color: yellow;
+        text-style: bold;
+        height: 2;
+        width: 100%;
+        layout: vertical;
+        align: center middle;
+    }
+    ModalPrompt Label { width: 100%; text-align: center; }
+    ModalPrompt Horizontal { width: 100%; height: 1; align: center middle; }
+    ModalPrompt .btn { padding: 0 1; width: auto; background: yellow; color: #4b0082; text-style: bold; }
+    ModalPrompt .btn:hover { text-style: reverse; }
+    """
 
-    def on_mouse_down(self):
-        getattr(self._app_ref, self._action)()
+    def __init__(self, phrase, callback, buttons="Y,N"):
+        self._phrase = phrase
+        self._callback = callback
+        self._buttons = [b.strip() for b in buttons.split(",")]
+        super().__init__()
+
+    def compose(self) -> ComposeResult:
+        yield Label(self._phrase)
+        yield Horizontal(*[Button(f"({btn})", self, "_respond", btn) for btn in self._buttons])
+
+    def _respond(self, label):
+        self._callback(label)
 
 
 class TmuxTabs(App):
     DEFAULT_CSS = ""
-    windows = reactive([], recompose=True)
-    confirming = reactive(False, recompose=True)
+    windows = reactive({}, recompose=True)  # {window_id: window dict}, see _windows_from
+    # Confirm target: _APP_CLOSE to close the app, a window index to close a tab, None = no modal.
+    confirming_close = reactive(None)
     _session = None         # our session id; placeholder management is scoped to it
     _pane_id = None
     _current_window = None  # window index the sidebar currently sits in
@@ -143,15 +208,17 @@ class TmuxTabs(App):
         normal, bell, current = (style_to_css(s[k], base) for k in ("normal", "bell", "current"))
         return f"""
     * {{ scrollbar-background: {bg}; scrollbar-color: {fg}; scrollbar-size: 0 0; }}
-    Screen {{ background: {bg}; color: {fg}; layers: base; border-bottom: hkey black; }}
+    Screen {{ background: {bg}; color: {fg}; layers: base overlay; border-bottom: hkey black; }}
     #banner {{ height: auto; width: 100%; background: {bg}; border-bottom: block yellow; }}
     #title {{ padding: 0 1; width: 1fr; background: yellow; color: #4b0082; text-style: bold; }}
     .btn {{ padding: 0 1; background: yellow; color: #4b0082; }}
     .btn:hover {{ text-style: reverse; }}
     #windows {{ height: 1fr; overflow-y: auto; background: {bg}; align: left middle; }}
-    .window {{ padding: 0 1; height: 2; width: 100%; {normal} }}
+    .window {{ height: 2; width: 100%; layout: horizontal; {normal} }}
+    .window-text {{ padding: 0 1; width: 1fr; height: 100%; }}
     .window .dim {{ color: {fg}; text-style: dim; }}
     .window:hover {{ background: {fg}; color: {bg}; }}
+    .row-x {{ display: none; }}
     .bell {{ {bell} }}
     .bell:hover {{ {bell} text-style: bold reverse; }}
     .active {{ {current} }}
@@ -161,20 +228,53 @@ class TmuxTabs(App):
     """
 
     def compose(self) -> ComposeResult:
-        if self.confirming:
-            banner = [Label("close?", id="title"), Button("(Y)", self, "exit"),
-                      Button("(N)", self, "cancel_close")]
+        yield Horizontal(
+            Label("[b]tmux-tabs by gus pozuelo[/b]", id="title", markup=True),
+            Button("(X)", self, "ask_close"),
+            id="banner",
+        )
+        yield Vertical(*[WindowItem(w, self) for w in self.windows.values()], id="windows")
+
+    async def watch_confirming_close(self, target):
+        # Await the removal (remove() is async): the covered row only repaints once the overlay is
+        # actually gone, so without the await its title flashes blank on the next frame.
+        await self.query(ModalPrompt).remove()
+        if target is None:
+            return
+        if target is _APP_CLOSE:
+            self.query_one("#banner").mount(ModalPrompt(
+                "close app?", lambda r: self.exit() if r == "Y" else self.cancel()))
         else:
-            banner = [Label("[b]tmux-tabs by gus pozuelo[/b]", id="title", markup=True),
-                      Button("(X)", self, "ask_close")]
-        yield Horizontal(*banner, id="banner")
-        yield Vertical(*[WindowItem(w, self) for w in self.windows], id="windows")
+            win = self.windows[target]
+            anchor = next(w for w in self.query(WindowItem) if w.win_index == target)
+            anchor.mount(ModalPrompt(f"close {win['name']}?",
+                lambda r: self.close_window(target) if r == "Y" else self.cancel()))
+
+    def cancel(self):
+        self.confirming_close = None
+
+    def on_mouse_down(self, event):
+        # Click anywhere outside the modal dismisses it.
+        if (ms := self.query(ModalPrompt)) and not ms.first().region.contains(event.x, event.y):
+            self.cancel()
 
     def ask_close(self):
-        self.confirming = True
+        self.confirming_close = _APP_CLOSE
 
-    def cancel_close(self):
-        self.confirming = False
+    def ask_close_window(self, win_index):
+        self.confirming_close = win_index
+
+    def close_window(self, win_index):
+        # Kill every CONTENT pane of the target window (a "(tmux-tabs)" title marks our sidebar AND our
+        # placeholders, so both are spared) — we can't rely on pane_active to pick one, since focus is
+        # on the sidebar when (X) is clicked. Once the window holds only our placeholder, the next
+        # refresh reaps it → the window closes. We can't kill-window: that would also kill the sidebar
+        # when closing the window we're in. Clearing confirming_close dismisses the modal.
+        self.confirming_close = None
+        for p in self.windows[win_index]["panes"]:
+            if p["title"] != "(tmux-tabs)":
+                tmux("kill-pane", "-t", p["pane"])
+        self.refresh_windows()
 
     def on_mount(self):
         self._pane_id = os.environ["TMUX_PANE"]
@@ -259,25 +359,26 @@ class TmuxTabs(App):
             if target := self.find_window("last") or self.find_window("active", False):
                 self.switch_to(target)
             return
-        self._sync_placeholders(panes, max(10, min(mine["width"], mine["win_width"] // 2)), mine["win"])
+        self._sync_placeholders(max(10, min(mine["width"], mine["win_width"] // 2)), mine["index"])
 
     def find_window(self, key, value=True):
-        return next((w["index"] for w in self.windows if w[key] == value), None)
+        return next((i for i, w in self.windows.items() if w[key] == value), None)
 
     @staticmethod
     def _windows_from(panes):
-        # Aggregate the flat pane dump into one row per window. Title is the active CONTENT pane's
-        # (not our "(tmux-tabs)" sidebar/placeholder); content_panes counts live (non-dead)
-        # non-placeholder panes — zero means dead. total_panes counts every pane, so the reaper can
-        # tell a lone placeholder (reap) from a placeholder beside a dead zombie pane (keep, show ☠️).
+        # Aggregate the flat pane dump into one dict per window, keyed by tmux window index (the tab
+        # number tmux commands target). Each entry carries a "panes" list of its raw pane dicts; the
+        # placeholder is the "(tmux-tabs)" pane within it. Title is the active CONTENT pane's;
+        # content_panes counts live non-placeholder panes — zero means dead. len(panes) lets the
+        # reaper distinguish a lone placeholder (reap) from a placeholder beside a dead zombie (keep, ☠️).
         windows = {}
         for p in panes:
-            if (w := windows.get(p["win"])) is None:  # first pane of this window — initialize the row
-                w = windows[p["win"]] = {"id": p["win"], "index": p["index"], "name": p["name"],
+            if (w := windows.get(p["index"])) is None:
+                w = windows[p["index"]] = {"index": p["index"], "name": p["name"],
                     "bell": p["bell"], "active": p["active"], "last": p["last"],
-                    "content_panes": 0, "total_panes": 0, "title": ""}
-            w["total_panes"] += 1
-            if p["title"] != "(tmux-tabs)":  # every content pane — accumulate
+                    "content_panes": 0, "title": "", "panes": []}
+            w["panes"].append(p)
+            if p["title"] != "(tmux-tabs)":
                 if not p["pane_dead"]:
                     w["content_panes"] += 1
                 if p["pane_active"]:
@@ -291,15 +392,13 @@ class TmuxTabs(App):
                 w["status"] = "bell"
             else:
                 w["status"] = ""
-        return list(windows.values())
+        return windows
 
-    def _sync_placeholders(self, panes, width, current):
+    def _sync_placeholders(self, width, current):
         # Every window except `current` (the one holding the sidebar) gets a thin placeholder in the
         # sidebar's slot, so content panes keep a constant width whether the sidebar or a placeholder
-        # sits beside them. Existing placeholders are read straight from the dump (a "(tmux-tabs)"
-        # pane that isn't us) — no hand-maintained dict to drift after swaps.
-        existing = {p["win"]: p for p in panes
-                    if p["title"] == "(tmux-tabs)" and p["pane"] != self._pane_id}
+        # sits beside them. Each window's placeholder (if any) is the "(tmux-tabs)" pane in its own
+        # pane list — no hand-maintained dict to drift after swaps.
         resize = width != self._width
         self._width = width
         # On a width change, settle the sidebar's own window first; main-pane-width is global so set
@@ -307,22 +406,21 @@ class TmuxTabs(App):
         if resize and USE_MAIN_VERTICAL:
             tmux("set-window-option", "-g", "main-pane-width", str(width))
             self._pin_pane(current, self._pane_id, width)
-        for w in self.windows:
-            if w["id"] == current:
+        for index, w in self.windows.items():
+            if index == current:
                 continue
-            ph = existing.get(w["id"])
-            if ph and w["total_panes"] == 1:
+            ph = next((p for p in w["panes"] if p["title"] == "(tmux-tabs)" and p["pane"] != self._pane_id), None)
+            if ph and len(w["panes"]) == 1:
                 # Reap: our placeholder is the SOLE pane (content all gone) — let the window close.
                 # A dead zombie pane still counts, so those windows survive to show ☠️.
                 tmux("kill-pane", "-t", ph["pane"])
-            elif ph:
+            elif not ph:
+                self._make_placeholder(index, str(width))
+            elif width != ph["width"]:
                 # Re-pin any placeholder whose actual width drifted from target — not just on global
                 # resize. Placeholders made during switch_to (or before main-pane-width settled) can
                 # be stuck at a stale width; the dump already carries each one's width, so this is free.
-                if width != ph["width"]:
-                    self._pin_pane(w["index"], ph["pane"], width)
-            else:
-                self._make_placeholder(w["index"], str(width))
+                self._pin_pane(index, ph["pane"], width)
 
     def _pin_pane(self, win_index, pane, width):
         # Pin the sidebar to a fixed width: main-vertical (sidebar = left main pane, content stacks
@@ -381,8 +479,8 @@ class TmuxTabs(App):
         if self._selected_pane:
             tmux("select-pane", "-t", self._selected_pane)
         # Repaint the highlight in-memory (no tmux re-query): old window loses active, new gains it.
-        self.windows = [{**w, "active": w["index"] == win_index, "last": w["index"] == self._current_window}
-                        for w in self.windows]
+        self.windows = {i: {**w, "active": i == win_index, "last": i == self._current_window}
+                        for i, w in self.windows.items()}
         self._current_window = win_index
 
 
