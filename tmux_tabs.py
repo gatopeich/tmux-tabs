@@ -187,11 +187,16 @@ class TmuxTabs(App):
     windows = reactive({}, recompose=True)  # {window_index: window dict}, see _windows_from
     # Confirm target: _APP_CLOSE to close the app, a window index to close a tab, None = no modal.
     confirming_close = reactive(None)
+    # Global tmux hooks that poke our FIFO to trigger a refresh. client-resized fires the instant the
+    # terminal is resized so the sidebar re-pins to its fixed char width immediately, not on the slow
+    # poll (during which tmux's proportional float leaves the sidebar and placeholders visibly shrunk).
+    HOOKS = ("after-select-window", "after-new-window", "pane-focus-in", "client-resized")
     _session = None         # our session id; placeholder management is scoped to it
     _pane_id = None
     _current_window = None  # window index the sidebar currently sits in
     _selected_pane = None   # content pane beside us; bounce focus here, None when none exists
     _width = None           # the user's chosen fixed sidebar char count; only changes on a manual drag
+    _term_width = None      # last seen total window width; single-tab tiebreak for resize-vs-drag
     _pinned = None           # the clamped effective width we last pinned to; skip re-pin when unchanged
     _fifo_fd = None
 
@@ -293,7 +298,7 @@ class TmuxTabs(App):
         # Graceful quit (the [Y] confirm button): we're the only instance, so tear down what we set. Remove our
         # hooks — else they keep running run-shell on every window switch for a dead sidebar — and
         # reap our placeholders. (A crash skips this; the next launch resets hooks and reaps strays.)
-        for event in ("after-select-window", "after-new-window", "pane-focus-in"):
+        for event in self.HOOKS:
             tmux("set-hook", "-gu", event)
         f = tmux("list-panes", "-s", "-t", self._session, "-F", "#{pane_id}\n#{pane_title}").splitlines()
         for pid, title in zip(f[::2], f[1::2]):
@@ -317,7 +322,7 @@ class TmuxTabs(App):
         # `echo 1<>fifo` (read-write redirect) so the write never blocks when no reader is attached —
         # the hook is global and outlives us, so a stale FIFO must not hang.
         hook = f"run-shell -b 'echo 1<>{fifo_path}'"
-        for event in ("after-select-window", "after-new-window", "pane-focus-in"):
+        for event in self.HOOKS:
             tmux("set-hook", "-g", event, hook)
         # O_RDWR (not O_RDONLY): keep a write-end open ourselves so the FIFO never reaches EOF when
         # the hook's writer exits — an EOF read-end makes add_reader fire nonstop (a busy-loop).
@@ -362,20 +367,19 @@ class TmuxTabs(App):
             if target := self.find_window("last") or self.find_window("active", False):
                 self.switch_to(target)
             return
-        # Width is a FIXED char count, not re-derived from the live pane width each refresh (that would
-        # launder tmux's proportional float into the target and make the sidebar creep). Under main-
-        # vertical a terminal resize is absorbed by the content pane, so the sidebar's own width only
-        # ever changes when the user DRAGS the border — adopt that as the new fixed count, floored at 10.
-        # A drag below 10 is clamped up (and re-pinned), never stored; transient narrow reads can't drag
-        # the stored width below the floor.
-        # Holding the width fixed (and only re-pinning on a real drag, see _sync_placeholders) is what
-        # minimizes resize events on the content panes: every content window keeps a constant width as we
-        # swap the sidebar in and out, so the text output of long-running LLM sessions keeps a consistent
-        # wraparound shape instead of reflowing on each window switch.
-        if (w := max(10, mine["width"])) != self._width:
-            self._width = w
-        # Pass the stored width straight through (>=10). Per-window safety (never >= a window's own
-        # width) is enforced downstream by _pin_pane and _make_placeholder, which clamp to ww-1.
+        # The sidebar keeps a FIXED char width so content panes never reflow as we swap it between
+        # windows. When its live width drifts from what we pinned (_pinned), either the user dragged the
+        # border or the terminal resized — and tmux floats the sidebar proportionally on a resize, which
+        # we must NOT adopt as the new width. Distinguish by the total window width: a resize changes it,
+        # a drag never does. (Comparing placeholder widths instead would fail under window-size=latest,
+        # where background windows don't float until displayed.) Adopt only on a drag; then clear _pinned
+        # so _sync_placeholders re-pins the sidebar and all placeholders back to the fixed width — it
+        # skips the pin while _width == _pinned, which would leave a floated sidebar stuck.
+        if self._pinned is not None and mine["width"] != self._pinned:
+            if mine["win_width"] == self._term_width:  # window unchanged -> border drag
+                self._width = max(10, mine["width"])
+            self._pinned = None
+        self._term_width = mine["win_width"]
         self._sync_placeholders(self._width, mine["index"])
 
     def find_window(self, key, value=True):
@@ -418,8 +422,8 @@ class TmuxTabs(App):
         # pane list — no hand-maintained dict to drift after swaps.
         resize = width != self._pinned
         # Pin widths ONLY when the effective width actually changed (a drag or terminal resize), never
-        # on every refresh. _pin_pane sets a per-window-safe main-pane-width and applies the layout
-        # (or resizes the pane in fallback); settle the sidebar's own window first.
+        # on every refresh. The sidebar's own window needs the main-vertical layout to hold it as the
+        # left pane; settle it first.
         if resize:
             self._pin_pane(current, self._pane_id, width)
         for index, w in self.windows.items():
@@ -433,11 +437,19 @@ class TmuxTabs(App):
             elif not ph:
                 self._make_placeholder(index, width)
             elif resize and width != ph["width"]:
-                # On a width change, re-pin any placeholder still at the old width. Placeholders made
-                # during switch_to (or before main-pane-width settled) can be stuck stale; the dump
-                # already carries each one's width, so this only fires for those that actually differ.
-                self._pin_pane(index, ph["pane"], width)
+                # Re-pin any placeholder still at the old width. select-layout main-vertical only
+                # resizes the CURRENTLY displayed window (tmux lays out a window at its own size, which
+                # a background window doesn't recompute until shown), so a background placeholder is
+                # resized directly with resize-pane -x — which does take on an unshown window.
+                tmux("resize-pane", "-t", ph["pane"], "-x", str(self._safe_width(index, width)))
         self._pinned = width
+
+    @staticmethod
+    def _safe_width(win_index, width):
+        # Clamp a desired sidebar/placeholder width to this window's own width, leaving >=1 col for
+        # content. A value at/over the window width is an impossible layout that can wedge tmux.
+        ww = int(pane_var(win_index, "#{window_width}"))
+        return max(1, min(width, ww - 1))
 
     def _pin_pane(self, win_index, pane, width):
         # Pin the sidebar to a fixed width: main-vertical (sidebar = left main pane, content stacks
@@ -445,11 +457,9 @@ class TmuxTabs(App):
         # fails (older tmux), disable it for the rest of the run and resize the pane directly.
         global USE_MAIN_VERTICAL
         if USE_MAIN_VERTICAL:
-            # main-pane-width is global but select-layout applies it to THIS window; a value at/over
-            # this window's width is an impossible main-vertical layout that can wedge tmux. Set a
-            # per-window-safe value (leave >=1 col for content) just before laying it out.
-            ww = int(pane_var(win_index, "#{window_width}"))
-            tmux("set-window-option", "-t", win_index, "main-pane-width", str(max(1, min(width, ww - 1))))
+            # main-pane-width is per-window here (-t win_index); set a window-safe value just before
+            # laying it out.
+            tmux("set-window-option", "-t", win_index, "main-pane-width", str(self._safe_width(win_index, width)))
             try:
                 tmux("select-layout", "-t", win_index, "main-vertical", check=True)
                 return
@@ -462,13 +472,10 @@ class TmuxTabs(App):
         # sidebar itself, so a fresh bare launch reaps any leftover sidebar+placeholders in one sweep
         # before splitting.
         content = tmux("list-panes", "-t", win_index, "-f", "#{pane_active}", "-F", "#{pane_id}")
-        # Clamp the split width against THIS window's real width: self._width may exceed a narrower
-        # target window, and split-window -l at/over the window width is an impossible request that
-        # can leave the window wedged. Keep at least 1 column for content.
-        ww = int(pane_var(content, "#{window_width}"))
-        width = max(1, min(width, ww - 1))
         # -f: span the full window height on the left edge, so a multi-pane window still gets the
-        # placeholder as a single leftmost column (not split off just one content pane).
+        # placeholder as a single leftmost column (not split off just one content pane). Width is clamped
+        # window-safe (self._width may exceed a narrower target window) — see _safe_width.
+        width = self._safe_width(content, width)
         ph = tmux("split-window", "-t", content, "-fhb", "-l", str(width), "-d", "-P", "-F", "#{pane_id}", "cat")
         tmux("select-pane", "-t", ph, "-T", "(tmux-tabs)")
         return ph
@@ -489,6 +496,13 @@ class TmuxTabs(App):
         # first visited via a click gets the same width as every pre-provisioned one — no 10-char snap.
         placeholder = next((tgt[i] for i in range(0, len(tgt), 2) if tgt[i + 1] == "(tmux-tabs)"), None) \
             or self._make_placeholder(win_index, self._width)
+        # Resize the target placeholder to the stored width BEFORE swapping in. If tmux floated it while
+        # its window sat in the background (see AGENTS.md: background windows don't reflow until
+        # displayed), swapping into a stale slot would needlessly reflow the target's content pane at the
+        # wrong width until the post-switch re-pin. Resizing first means it never reflows. Use
+        # resize-pane, not _pin_pane's main-vertical layout — the target is still a background window and
+        # select-layout only takes on the displayed one.
+        tmux("resize-pane", "-t", placeholder, "-x", str(self._safe_width(win_index, self._width)))
         # Swap the sidebar with that placeholder: both windows keep their slot and width, so no
         # content reflows. -d so the displaced placeholder doesn't become active in the window we
         # leave (its "(tmux-tabs)" title would otherwise show as that window's title in the list).
@@ -506,6 +520,10 @@ class TmuxTabs(App):
         self.windows = {i: {**w, "active": i == win_index, "last": i == self._current_window}
                         for i, w in self.windows.items()}
         self._current_window = win_index
+        # The sidebar just swapped into the target's placeholder slot, inheriting its width (stale if
+        # tmux floated it while it sat there). Force a re-pin on the next refresh so the sidebar snaps
+        # back to the stored width instead of adopting the placeholder's — see refresh_windows.
+        self._pinned = None
 
 
 def main():
