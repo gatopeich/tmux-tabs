@@ -111,13 +111,14 @@ class WindowItem(Horizontal):
     # mouse jumps to another tmux pane, so we drive visibility from on_enter + a self-rescheduling timer).
     def __init__(self, win):
         self.win_index = win["index"]
-        icon = {"dead": "☠️", "active": "▶", "bell": "🔔"}.get(win["status"], " ")
+        self._status = win["status"]
+        icon = {"dead": "☠️", "active": "▶", "bell": "🔔"}.get(self._status, " ")
         title = win["title"].lstrip("✳").strip()
         name = escape(win["name"])
         title_esc = escape(title)
         self._label = (f"{icon} [b]{name}[/b]\n    [dim]{title_esc}[/dim]" if title
                        else f"{icon} [b]{name}[/b]")
-        super().__init__(classes=f"window {win['status']}".strip())
+        super().__init__(classes=f"window {self._status}".strip())
 
     def compose(self):
         yield Label(self._label, classes="window-text", markup=True)
@@ -139,7 +140,8 @@ class WindowItem(Horizontal):
         self.set_timer(1.0, hide_when_mouse_gone)
 
     def on_mouse_down(self):
-        self.app.switch_to(self.win_index)
+        if self._status != "dead":
+            self.app.switch_to(self.win_index)
 
 
 class ModalPrompt(Widget):
