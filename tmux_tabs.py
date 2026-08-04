@@ -228,11 +228,10 @@ class TmuxTabs(App):
         )
         yield Vertical(*[WindowItem(w) for w in self.windows.values()], id="windows")
 
-    def on_event(self, event):
+    async def on_event(self, event):
         try:
-            super().on_event(event)
+            await super().on_event(event)
         except Exception as e:
-            self.query(ModalPrompt).remove()
             self.query_one("#banner").mount(ModalPrompt(
                 f"error: {e}", self.cancel, buttons="OK"))
             self.refresh_windows()
