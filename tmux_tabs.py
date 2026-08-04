@@ -111,14 +111,13 @@ class WindowItem(Horizontal):
     # mouse jumps to another tmux pane, so we drive visibility from on_enter + a self-rescheduling timer).
     def __init__(self, win):
         self.win_index = win["index"]
-        self._status = win["status"]
-        icon = {"dead": "☠️", "active": "▶", "bell": "🔔"}.get(self._status, " ")
+        icon = {"dead": "☠️", "active": "▶", "bell": "🔔"}.get(win["status"], " ")
         title = win["title"].lstrip("✳").strip()
         name = escape(win["name"])
         title_esc = escape(title)
         self._label = (f"{icon} [b]{name}[/b]\n    [dim]{title_esc}[/dim]" if title
                        else f"{icon} [b]{name}[/b]")
-        super().__init__(classes=f"window {self._status}".strip())
+        super().__init__(classes=f"window {win['status']}".strip())
 
     def compose(self):
         yield Label(self._label, classes="window-text", markup=True)
@@ -140,8 +139,7 @@ class WindowItem(Horizontal):
         self.set_timer(1.0, hide_when_mouse_gone)
 
     def on_mouse_down(self):
-        if self._status != "dead":
-            self.app.switch_to(self.win_index)
+        self.app.switch_to(self.win_index)
 
 
 class ModalPrompt(Widget):
@@ -229,6 +227,15 @@ class TmuxTabs(App):
             id="banner",
         )
         yield Vertical(*[WindowItem(w) for w in self.windows.values()], id="windows")
+
+    def on_event(self, event):
+        try:
+            super().on_event(event)
+        except Exception as e:
+            self.query(ModalPrompt).remove()
+            self.query_one("#banner").mount(ModalPrompt(
+                f"error: {e}", self.cancel, buttons="OK"))
+            self.refresh_windows()
 
     async def watch_confirming_close(self, target):
         # Await the removal (remove() is async): the covered row only repaints once the overlay is
@@ -435,34 +442,17 @@ class TmuxTabs(App):
         return ph
 
     def switch_to(self, win_index):
-        # Resolve target window's active pane (window-number target is ambiguous from client context)
         target_pane = tmux("list-panes", "-t", win_index, "-f", "#{pane_active}", "-F", "#{pane_id}")
-        # The content pane to bounce focus to; None if the only pane there is us.
         self._selected_pane = target_pane if target_pane != self._pane_id else None
         if win_index == self._current_window:
-            if self._selected_pane:  # already here; just drop focus onto the content pane
+            if self._selected_pane:
                 tmux("select-pane", "-t", self._selected_pane)
             return
-        # Find the target window's placeholder (a "(tmux-tabs)" pane) to swap with, or make one.
-        # No dict to maintain — the placeholder is identified by title straight from tmux.
         tgt = tmux("list-panes", "-t", win_index, "-F", "#{pane_id}\n#{pane_title}").splitlines()
-        # New placeholders use the stored width (>=10), same source as _sync_placeholders, so a window
-        # first visited via a click gets the same width as every pre-provisioned one — no 10-char snap.
         placeholder = next((tgt[i] for i in range(0, len(tgt), 2) if tgt[i + 1] == "(tmux-tabs)"), None) \
             or self._make_placeholder(win_index, self._width)
-        # Resize the target placeholder to the stored width BEFORE swapping in. If tmux floated it while
-        # its window sat in the background (see AGENTS.md: background windows don't reflow until
-        # displayed), swapping into a stale slot would needlessly reflow the target's content pane at the
-        # wrong width until the post-switch re-pin. Resizing first means it never reflows. Use
-        # resize-pane, not _pin_pane's main-vertical layout — the target is still a background window and
-        # select-layout only takes on the displayed one.
         tmux("resize-pane", "-t", placeholder, "-x", str(_safe_width(win_index, self._width)))
-        # Swap the sidebar with that placeholder: both windows keep their slot and width, so no
-        # content reflows. -d so the displaced placeholder doesn't become active in the window we
-        # leave (its "(tmux-tabs)" title would otherwise show as that window's title in the list).
         tmux("swap-pane", "-d", "-s", self._pane_id, "-t", placeholder)
-        # The placeholder now sits where the sidebar was in the window we left; activate that
-        # window's content pane so its title (not "(tmux-tabs)") shows in the list.
         old_panes = tmux("list-panes", "-t", self._current_window, "-F", "#{pane_id}").splitlines()
         content = next((p for p in old_panes if p != placeholder), None)
         if content:
@@ -470,13 +460,9 @@ class TmuxTabs(App):
         tmux("select-window", "-t", win_index)
         if self._selected_pane:
             tmux("select-pane", "-t", self._selected_pane)
-        # Repaint the highlight in-memory (no tmux re-query): old window loses active, new gains it.
         self.windows = {i: {**w, "active": i == win_index, "last": i == self._current_window}
                         for i, w in self.windows.items()}
         self._current_window = win_index
-        # The sidebar just swapped into the target's placeholder slot, inheriting its width (stale if
-        # tmux floated it while it sat there). Force a re-pin on the next refresh so the sidebar snaps
-        # back to the stored width instead of adopting the placeholder's — see refresh_windows.
         self._pinned = None
 
 
