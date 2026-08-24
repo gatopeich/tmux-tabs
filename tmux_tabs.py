@@ -20,9 +20,12 @@ sidebar matches your current byobu/tmux color scheme automatically.
 """
 
 import asyncio
+import glob
+import json
 import os
 import subprocess
 import sys
+from pathlib import Path
 from rich.markup import escape
 from textual.app import App
 from textual.containers import Horizontal, Vertical
@@ -33,6 +36,8 @@ from textual.widgets import Label
 
 
 _APP_CLOSE = object()  # sentinel: confirming_close == _APP_CLOSE means close the app, not a tab
+
+HISTORY_DIR = Path.home() / ".cache" / "tmux-tabs"
 
 
 def tmux(*args, check=False):
@@ -53,7 +58,7 @@ def pane_var(pane, fmt):
     return tmux("display-message", "-p", "-t", pane, fmt)
 
 
-PANE_FIELDS = 11  # fields per pane in the dump below; free-text name/title kept last (newline-safe)
+PANE_FIELDS = 13  # fields per pane in the dump below; free-text name/title kept last (newline-safe)
 
 
 def tmux_panes(session):
@@ -63,13 +68,38 @@ def tmux_panes(session):
     # newlines in them). Fixed groups; name and title come last.
     f = tmux("list-panes", "-s", "-t", session, "-F", "#{window_id}\n#{window_index}\n#{window_flags}\n"
              "#{window_bell_flag}\n#{pane_id}\n#{pane_active}\n#{pane_dead}\n#{pane_width}\n#{window_width}\n"
+             "#{pane_current_command}\n#{pane_current_path}\n"
              "#{window_name}\n#{pane_title}").splitlines()
     return [
         {"win": wid, "index": idx, "active": "*" in flags, "last": "-" in flags,
          "bell": bell == "1", "pane": pid, "pane_active": pa == "1", "pane_dead": dead == "1",
-         "width": int(width), "win_width": int(ww), "name": name, "title": title}
-        for wid, idx, flags, bell, pid, pa, dead, width, ww, name, title in zip(*[iter(f)] * PANE_FIELDS)
+         "width": int(width), "win_width": int(ww), "command": command, "cwd": cwd,
+         "name": name, "title": title}
+        for wid, idx, flags, bell, pid, pa, dead, width, ww, command, cwd, name, title
+        in zip(*[iter(f)] * PANE_FIELDS)
     ]
+
+
+def claude_session_for(cwd, title):
+    # Claude Code names each project dir after its cwd with "/" -> "-", and writes a {"type":
+    # "ai-title", "aiTitle": ..., "sessionId": ...} record into a session's own file whenever it sets
+    # the pane title — so the pane's live title (minus the leading bell marker) uniquely identifies
+    # which session file is actually running in this pane, no recency guessing needed.
+    project_dir = Path.home() / ".claude" / "projects" / cwd.replace("/", "-")
+    needle = f'"aiTitle":{json.dumps(title.lstrip("✳").strip())}'
+    matches = [p for p in glob.glob(str(project_dir / "*.jsonl")) if needle in Path(p).read_text()]
+    if not matches:
+        return None
+    return Path(max(matches, key=os.path.getmtime)).stem
+
+
+def write_pane_history(pane_id, name, title, cwd, command):
+    HISTORY_DIR.mkdir(parents=True, exist_ok=True)
+    lines = [name, title, cwd, command]
+    if command == "claude" and (session := claude_session_for(cwd, title)):
+        lines.append(session)
+    path = HISTORY_DIR / f"tmux-tab-{pane_id.lstrip('%')}"
+    path.write_text("\n".join(lines) + "\n")
 
 
 def parse_style(style):
@@ -191,6 +221,7 @@ class TmuxTabs(App):
     _term_width = None      # last seen total window width; single-tab tiebreak for resize-vs-drag
     _pinned = None           # the clamped effective width we last pinned to; skip re-pin when unchanged
     _fifo_fd = None
+    _history_seen = None    # {pane_id: (name, title)} last written to history — skip rewrite when unchanged
 
     @classmethod
     def build_css(cls):
@@ -204,6 +235,7 @@ class TmuxTabs(App):
     Screen {{ background: {bg}; color: {fg}; layers: base overlay; border-bottom: hkey black; }}
     #banner {{ height: auto; width: 100%; background: {bg}; border-bottom: block yellow; }}
     #title {{ padding: 0 1; width: 1fr; background: yellow; color: #4b0082; text-style: bold; }}
+    #footer {{ height: auto; width: 100%; background: {bg}; align: center middle; }}
     .btn {{ padding: 0 1; background: yellow; color: #4b0082; }}
     .btn:hover {{ text-style: reverse; }}
     #windows {{ height: 1fr; overflow-y: auto; background: {bg}; align: left middle; }}
@@ -227,6 +259,7 @@ class TmuxTabs(App):
             id="banner",
         )
         yield Vertical(*[WindowItem(w) for w in self.windows.values()], id="windows")
+        yield Horizontal(Button("<history>", self.show_history), id="footer")
 
     async def on_event(self, event):
         try:
@@ -265,6 +298,14 @@ class TmuxTabs(App):
     def ask_close(self):
         self.confirming_close = _APP_CLOSE
 
+    def show_history(self):
+        # New window (not a pane here) so the fixed-width sidebar layout is untouched. -F "%T %p":
+        # mtime-seconds then path, so `sort -rn` orders files newest-first without a subshell per file.
+        cmd = (f"cd {HISTORY_DIR} && "
+               "find . -maxdepth 1 -name 'tmux-tab-*' -printf '%T@ %p\\n' | sort -rn | cut -d' ' -f2- "
+               "| xargs -I{} sh -c 'echo ==== {} ====; cat {}; echo' | less")
+        tmux("new-window", "-t", self._session, "-n", "HISTORY", cmd)
+
     def ask_close_window(self, win_index):
         self.confirming_close = win_index
 
@@ -294,6 +335,7 @@ class TmuxTabs(App):
         win = int(pane_var(self._pane_id, "#{window_width}"))
         self._width = max(10, min(32, win // 2))
         tmux("select-pane", "-t", self._pane_id, "-T", "(tmux-tabs)")
+        self._history_seen = {}
         self._setup_fifo()
         # Events (hooks below) drive updates; the poll is just a slow safety net, so keep it light.
         self.set_interval(3.0, self.refresh_windows)
@@ -346,6 +388,19 @@ class TmuxTabs(App):
         if self._selected_pane:
             tmux("select-pane", "-t", self._selected_pane)
 
+    def _record_history(self, panes):
+        # One history file per content pane, rewritten only when its name or title actually changed
+        # (avoids a disk write every 3s poll for idle panes). Sidebar/placeholder panes carry no
+        # useful name/title of their own, so they're skipped.
+        for p in panes:
+            if p["title"] == "(tmux-tabs)" or p["pane_dead"]:
+                continue
+            key = (p["name"], p["title"])
+            if self._history_seen.get(p["pane"]) == key:
+                continue
+            self._history_seen[p["pane"]] = key
+            write_pane_history(p["pane"], p["name"], p["title"], p["cwd"], p["command"])
+
     def refresh_windows(self):
         # ONE tmux read for the whole refresh: dump every pane, derive everything in Python, then act
         # on where focus actually landed. No re-entrancy guard needed: asyncio reader callbacks run to
@@ -353,6 +408,7 @@ class TmuxTabs(App):
         # by which point _current_window is updated and the echo is filtered as "the window we're on".
         panes = tmux_panes(self._session)
         self.windows = _windows_from(panes)
+        self._record_history(panes)
         mine = next((p for p in panes if p["pane"] == self._pane_id), None)
         if not mine:
             return

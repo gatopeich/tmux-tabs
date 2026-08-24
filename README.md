@@ -17,6 +17,9 @@ at a glance.
   sidebar slot and swapping it with the real sidebar, so panes never reflow as you move around.
 - A yellow title bar with a `(X)` close button (with a `(Y)`/`(N)` confirm) — no need to focus the
   pane to quit.
+- Keeps a basic history of every panel in `~/.cache/tmux-tabs/`: one file per pane, recording its
+  name, title, working directory, running command, and (best-effort) Claude session id. A
+  `<history>` button opens a `HISTORY` window listing them all, newest-changed first.
 
 Colors are read live from your tmux/byobu theme (`window-status-style`, etc.), so the sidebar
 matches your color scheme automatically.
