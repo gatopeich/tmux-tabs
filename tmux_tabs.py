@@ -497,8 +497,14 @@ class TmuxTabs(App):
         return ph
 
     def switch_to(self, win_index):
-        target_pane = tmux("list-panes", "-t", win_index, "-f", "#{pane_active}", "-F", "#{pane_id}")
-        self._selected_pane = target_pane if target_pane != self._pane_id else None
+        # Resolve target window's active pane (window-number target is ambiguous from client context).
+        # The content pane to bounce focus to; None if the active pane there is our own sidebar or a
+        # bare placeholder (e.g. a window whose content just died, leaving the placeholder as the sole
+        # and thus "active" pane) — bouncing onto a placeholder would leave the sidebar's swapped-in
+        # pane holding focus in the target window instead.
+        active_id, _, active_title = tmux("list-panes", "-t", win_index, "-f", "#{pane_active}",
+                                           "-F", "#{pane_id}\n#{pane_title}").partition("\n")
+        self._selected_pane = active_id if active_id != self._pane_id and active_title != "(tmux-tabs)" else None
         if win_index == self._current_window:
             if self._selected_pane:
                 tmux("select-pane", "-t", self._selected_pane)
