@@ -238,7 +238,10 @@ class TmuxTabs(App):
     #footer {{ height: auto; width: 100%; background: {bg}; align: center middle; }}
     .btn {{ padding: 0 1; background: yellow; color: #4b0082; }}
     .btn:hover {{ text-style: reverse; }}
-    #windows {{ height: 1fr; overflow-y: auto; background: {bg}; align: left middle; }}
+    #windows {{ height: 1fr; overflow-y: auto; background: {bg}; align: left middle;
+                scrollbar-size-vertical: 1; scrollbar-background: {bg}; scrollbar-background-hover: {bg};
+                scrollbar-background-active: {bg}; scrollbar-color: {fg} 60%; scrollbar-color-hover: {fg} 80%;
+                scrollbar-color-active: {fg}; }}
     .window {{ height: 2; width: 100%; layout: horizontal; {normal} }}
     .window-text {{ padding: 0 1; width: 1fr; height: 100%; }}
     .window .dim {{ color: {fg}; text-style: dim; }}
@@ -519,8 +522,15 @@ class TmuxTabs(App):
         if content:
             tmux("select-pane", "-t", content)
         tmux("select-window", "-t", win_index)
-        if self._selected_pane:
-            tmux("select-pane", "-t", self._selected_pane)
+        # Bounce the target window's own active-pane state off the placeholder we just swapped out:
+        # left alone, tmux still considers the placeholder "active" there (it was, until swap-pane),
+        # so its title would read blank on next refresh. _selected_pane is the real content pane to
+        # land on if there is one; otherwise fall back to whatever the swap-pane left behind.
+        target = self._selected_pane or next(
+            (p for p in tmux("list-panes", "-t", win_index, "-F", "#{pane_id}").splitlines()
+             if p != self._pane_id), None)
+        if target:
+            tmux("select-pane", "-t", target)
         self.windows = {i: {**w, "active": i == win_index, "last": i == self._current_window}
                         for i, w in self.windows.items()}
         self._current_window = win_index
@@ -543,7 +553,7 @@ def _windows_from(panes):
         if p["title"] != "(tmux-tabs)":
             if not p["pane_dead"]:
                 w["content_panes"] += 1
-            if p["pane_active"]:
+            if p["pane_active"] or not w["title"]:
                 w["title"] = p["title"]
     for w in windows.values():
         if not w["content_panes"]:
