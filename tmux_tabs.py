@@ -25,9 +25,11 @@ import json
 import os
 import subprocess
 import sys
+import time
 from pathlib import Path
 from rich.markup import escape
 from textual.app import App
+from textual.color import Color, ColorParseError
 from textual.containers import Horizontal, Vertical
 from textual.css.query import NoMatches
 from textual.reactive import reactive
@@ -58,7 +60,7 @@ def pane_var(pane, fmt):
     return tmux("display-message", "-p", "-t", pane, fmt)
 
 
-PANE_FIELDS = 13  # fields per pane in the dump below; free-text name/title kept last (newline-safe)
+PANE_FIELDS = 14  # fields per pane in the dump below; free-text name/title kept last (newline-safe)
 
 
 def tmux_panes(session):
@@ -68,14 +70,14 @@ def tmux_panes(session):
     # newlines in them). Fixed groups; name and title come last.
     f = tmux("list-panes", "-s", "-t", session, "-F", "#{window_id}\n#{window_index}\n#{window_flags}\n"
              "#{window_bell_flag}\n#{pane_id}\n#{pane_active}\n#{pane_dead}\n#{pane_width}\n#{window_width}\n"
-             "#{pane_current_command}\n#{pane_current_path}\n"
+             "#{window_activity}\n#{pane_current_command}\n#{pane_current_path}\n"
              "#{window_name}\n#{pane_title}").splitlines()
     return [
         {"win": wid, "index": idx, "active": "*" in flags, "last": "-" in flags,
          "bell": bell == "1", "pane": pid, "pane_active": pa == "1", "pane_dead": dead == "1",
-         "width": int(width), "win_width": int(ww), "command": command, "cwd": cwd,
+         "width": int(width), "win_width": int(ww), "activity": int(activity), "command": command, "cwd": cwd,
          "name": name, "title": title}
-        for wid, idx, flags, bell, pid, pa, dead, width, ww, command, cwd, name, title
+        for wid, idx, flags, bell, pid, pa, dead, width, ww, activity, command, cwd, name, title
         in zip(*[iter(f)] * PANE_FIELDS)
     ]
 
@@ -118,7 +120,18 @@ def style_to_css(s, base=None):
     if s.get("reverse"):
         bg, fg = fg, bg
     bold = "\n        text-style: bold;" if s.get("bold") else ""
-    return f"background: {bg};\n        color: {fg};{bold}"
+    return f"background: {bg};\n        color: {fg};{bold}", bg
+
+
+def hover_nudge(color, amount=0.2):
+    # A visibly shifted variant of a row's own background for :hover. Nudge AWAY from the row's
+    # brightness rather than always darkening: the current-window style is usually reverse, making its
+    # effective background black, and darkening black leaves it black.
+    try:
+        col = Color.parse(color)
+    except ColorParseError:
+        return color  # tmux's "default" (and colour4/brightblack) have no RGB to shift
+    return (col.lighten(amount) if col.brightness < 0.5 else col.darken(amount)).hex
 
 
 class Button(Label):
@@ -128,11 +141,26 @@ class Button(Label):
         # markup=False: "[X]"/"[Y]"/"[N]" must render literally, not be parsed as Rich tags.
         super().__init__(label, classes=classes, markup=False)
 
-    def on_mouse_down(self, event):
-        # Stop the press bubbling to the enclosing WindowItem, whose own on_mouse_down would otherwise
-        # switch to the window when the user only meant to click this button.
+    def on_click(self, event):
+        # Click, not mouse down, to match WindowItem: App synthesizes Click from the pressed widget
+        # regardless of whether MouseDown was stopped, so stopping the press would no longer keep the
+        # enclosing row from also switching windows. Stopping the Click itself does.
         event.stop()
         self._callback(*self._args)
+
+
+CLEAR_TAG = "❌"  # last choice in the tag menu: removes the window's tag instead of setting one
+EMOJI_CHOICES = ["🚩", "⏳", "📌", "⭐", "🧊", CLEAR_TAG]  # urgent, waiting, pinned, important, stale
+
+
+def _age_str(seconds):
+    if seconds < 60:
+        return "just now"
+    if seconds < 3600:
+        return f"{seconds // 60}m ago"
+    if seconds < 86400:
+        return f"{seconds // 3600}h ago"
+    return f"{seconds // 86400}d ago"
 
 
 class WindowItem(Horizontal):
@@ -141,17 +169,25 @@ class WindowItem(Horizontal):
     # mouse jumps to another tmux pane, so we drive visibility from on_enter + a self-rescheduling timer).
     def __init__(self, win):
         self.win_index = win["index"]
-        icon = {"dead": "☠️", "active": "▶", "bell": "🔔"}.get(win["status"], " ")
-        title = win["title"].lstrip("✳").strip()
-        name = escape(win["name"])
-        title_esc = escape(title)
-        self._label = (f"{icon} [b]{name}[/b]\n    [dim]{title_esc}[/dim]" if title
-                       else f"{icon} [b]{name}[/b]")
+        # The trailing "!" is an external convention marking a hand-set name that scripts must not
+        # auto-rename over; it is bookkeeping, so strip it from what we show.
+        name = escape(win["name"].rstrip("!"))
+        title = escape(win["title"].lstrip("✳").strip())
+        self._label = f"[b]{name}[/b]\n    [dim]{title}[/dim]" if title else f"[b]{name}[/b]"
+        marker = {"dead": "☠️", "bell": "🔔"}.get(win["status"], " ")
+        self._icon_col = f"{marker}\n{win.get('emoji') or ' '}"  # status marker, user's tag below it
         super().__init__(classes=f"window {win['status']}".strip())
+        # tooltip's setter reaches for the screen, so it must follow super().__init__().
+        if age := win.get("activity_age"):
+            self.tooltip = f"last activity: {_age_str(age)}"
 
     def compose(self):
+        yield Label(self._icon_col, classes="window-icon", markup=False)
         yield Label(self._label, classes="window-text", markup=True)
         yield Button("(X)", self.app.ask_close_window, self.win_index, classes="row-x")
+        # Always rendered on both of the row's lines, pointing at the content pane to our right; CSS
+        # reveals it only on the .active row, so switching is a class toggle and never a re-render.
+        yield Label("▶\n▶", classes="window-arrow", markup=False)
 
     def on_enter(self):
         try:
@@ -168,8 +204,15 @@ class WindowItem(Horizontal):
                 x.display = False
         self.set_timer(1.0, hide_when_mouse_gone)
 
-    def on_mouse_down(self):
-        self.app.switch_to(self.win_index)
+    def on_click(self, event):
+        # Click, not mouse down/up: Textual raises it only for a press and release on the SAME widget,
+        # which is the click-vs-drag distinction we'd otherwise hand-roll. It follows that switch_to
+        # must not recompose these rows — a rebuilt row is a different object, and the identity check
+        # in App's Click synthesis would then never match. See switch_to.
+        if event.button == 3:
+            self.app.ask_tag_window(self.win_index)
+        else:
+            self.app.switch_to(self.win_index)
 
 
 class ModalPrompt(Widget):
@@ -222,6 +265,9 @@ class TmuxTabs(App):
     _pinned = None           # the clamped effective width we last pinned to; skip re-pin when unchanged
     _fifo_fd = None
     _history_seen = None    # {pane_id: (name, title)} last written to history — skip rewrite when unchanged
+    _bell_latch = None       # {window_id: True} bell seen since last viewed — survives tmux's index-based
+                             # window_bell_flag losing track of the window across swap-window/move-window
+    _emoji = None            # {window_id: emoji} user-assigned tag, right-click menu; in-memory only
 
     @classmethod
     def build_css(cls):
@@ -229,7 +275,9 @@ class TmuxTabs(App):
         base = s["status"]
         bg = s["normal"].get("bg", base.get("bg", "#94cdba"))
         fg = s["normal"].get("fg", base.get("fg", "black"))
-        normal, bell, current = (style_to_css(s[k], base) for k in ("normal", "bell", "current"))
+        (normal, normal_bg), (bell, bell_bg), (current, current_bg) = (
+            style_to_css(s[k], base) for k in ("normal", "bell", "current"))
+        normal_hover, bell_hover, current_hover = (hover_nudge(b) for b in (normal_bg, bell_bg, current_bg))
         return f"""
     * {{ scrollbar-background: {bg}; scrollbar-color: {fg}; scrollbar-size: 0 0; }}
     Screen {{ background: {bg}; color: {fg}; layers: base overlay; border-bottom: hkey black; }}
@@ -243,14 +291,17 @@ class TmuxTabs(App):
                 scrollbar-background-active: {bg}; scrollbar-color: {fg} 60%; scrollbar-color-hover: {fg} 80%;
                 scrollbar-color-active: {fg}; }}
     .window {{ height: 2; width: 100%; layout: horizontal; {normal} }}
+    .window-icon {{ width: 2; height: 100%; text-align: center; }}
     .window-text {{ padding: 0 1; width: 1fr; height: 100%; }}
+    .window-arrow {{ width: 1; height: 100%; visibility: hidden; }}
+    .active .window-arrow {{ visibility: visible; }}
     .window .dim {{ color: {fg}; text-style: dim; }}
-    .window:hover {{ background: {fg}; color: {bg}; }}
+    .window:hover {{ background: {normal_hover}; }}
     .row-x {{ display: none; }}
     .bell {{ {bell} }}
-    .bell:hover {{ {bell} text-style: bold reverse; }}
+    .bell:hover {{ {bell} background: {bell_hover}; }}
     .active {{ {current} }}
-    .active:hover {{ {current} }}
+    .active:hover {{ {current} background: {current_hover}; }}
     .dead {{ background: grey; color: {fg}; }}
     .dead .dim {{ color: {fg}; }}
     """
@@ -312,6 +363,19 @@ class TmuxTabs(App):
     def ask_close_window(self, win_index):
         self.confirming_close = win_index
 
+    def ask_tag_window(self, win_index):
+        # Reuses the confirm overlay: same shape (a phrase over a row of buttons), so the tag menu is
+        # one mount. Keyed by window_id, not index, so a tag follows its window across a tmux reorder.
+        window_id = self.windows[win_index]["win"]
+        def pick(emoji):
+            if emoji == CLEAR_TAG:
+                self._emoji.pop(window_id, None)
+            else:
+                self._emoji[window_id] = emoji
+            self.refresh_windows()  # recomposes the rows, which takes the overlay with them
+        anchor = next(w for w in self.query(WindowItem) if w.win_index == win_index)
+        anchor.mount(ModalPrompt("tag window", pick, buttons=",".join(EMOJI_CHOICES)))
+
     def close_window(self, win_index):
         # Kill every CONTENT pane of the target window (a "(tmux-tabs)" title marks our sidebar AND our
         # placeholders, so both are spared) — we can't rely on pane_active to pick one, since focus is
@@ -339,6 +403,8 @@ class TmuxTabs(App):
         self._width = max(10, min(32, win // 2))
         tmux("select-pane", "-t", self._pane_id, "-T", "(tmux-tabs)")
         self._history_seen = {}
+        self._bell_latch = {}
+        self._emoji = {}
         self._setup_fifo()
         # Events (hooks below) drive updates; the poll is just a slow safety net, so keep it light.
         self.set_interval(3.0, self.refresh_windows)
@@ -410,7 +476,21 @@ class TmuxTabs(App):
         # completion one at a time, so our own select-window/swap echo arrives only AFTER this returns —
         # by which point _current_window is updated and the echo is filtered as "the window we're on".
         panes = tmux_panes(self._session)
-        self.windows = _windows_from(panes)
+        windows = _windows_from(panes)
+        now = int(time.time())
+        for w in windows.values():
+            # Latch bell by window_id, not index: tmux's own window_bell_flag stays attached to the
+            # index slot across swap-window/move-window, so a moved window can lose its bell (or a
+            # window swapped INTO that slot can wrongly inherit one) if we trust the raw flag alone.
+            if w["bell"]:
+                self._bell_latch[w["win"]] = True
+            elif w["status"] == "active":
+                self._bell_latch.pop(w["win"], None)  # viewing the window clears its latch
+            if self._bell_latch.get(w["win"]) and w["status"] not in ("dead", "active"):
+                w["status"] = "bell"
+            w["emoji"] = self._emoji.get(w["win"])
+            w["activity_age"] = max(0, now - w["activity"])
+        self.windows = windows
         self._record_history(panes)
         mine = next((p for p in panes if p["pane"] == self._pane_id), None)
         if not mine:
@@ -531,8 +611,17 @@ class TmuxTabs(App):
              if p != self._pane_id), None)
         if target:
             tmux("select-pane", "-t", target)
-        self.windows = {i: {**w, "active": i == win_index, "last": i == self._current_window}
-                        for i, w in self.windows.items()}
+        # Repaint the selection by mutating the dict IN PLACE and toggling the class, never by
+        # reassigning self.windows: that reactive recomposes every row, and destroying the row under
+        # the cursor mid-click means App never synthesizes the Click that brought us here (its
+        # press/release identity check fails), which wedged the whole sidebar after one click.
+        # dead/bell rows keep their status so the bell latch survives.
+        for i, w in self.windows.items():
+            w["active"], w["last"] = i == win_index, i == self._current_window
+            if w["status"] in ("active", ""):
+                w["status"] = "active" if w["active"] else ""
+        for row in self.query(WindowItem):
+            row.set_class(row.win_index == win_index, "active")
         self._current_window = win_index
         self._pinned = None
 
@@ -546,10 +635,11 @@ def _windows_from(panes):
     windows = {}
     for p in panes:
         if (w := windows.get(p["index"])) is None:
-            w = windows[p["index"]] = {"index": p["index"], "name": p["name"],
-                "bell": p["bell"], "active": p["active"], "last": p["last"],
+            w = windows[p["index"]] = {"index": p["index"], "win": p["win"], "name": p["name"],
+                "bell": p["bell"], "active": p["active"], "last": p["last"], "activity": p["activity"],
                 "content_panes": 0, "title": "", "panes": []}
         w["panes"].append(p)
+        w["activity"] = max(w["activity"], p["activity"])
         if p["title"] != "(tmux-tabs)":
             if not p["pane_dead"]:
                 w["content_panes"] += 1
