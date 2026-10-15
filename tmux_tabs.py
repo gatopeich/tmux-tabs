@@ -20,12 +20,13 @@ sidebar matches your current byobu/tmux color scheme automatically.
 """
 
 import asyncio
+import faulthandler
 import glob
 import json
 import os
+import signal
 import subprocess
 import sys
-import time
 from pathlib import Path
 from rich.markup import escape
 from textual.app import App
@@ -40,6 +41,7 @@ from textual.widgets import Label
 _APP_CLOSE = object()  # sentinel: confirming_close == _APP_CLOSE means close the app, not a tab
 
 HISTORY_DIR = Path.home() / ".cache" / "tmux-tabs"
+TRACEBACK_LOG = HISTORY_DIR / "traceback.log"  # where SIGUSR1 dumps stacks; see _enable_traceback_dump
 
 
 def tmux(*args, check=False):
@@ -60,7 +62,7 @@ def pane_var(pane, fmt):
     return tmux("display-message", "-p", "-t", pane, fmt)
 
 
-PANE_FIELDS = 14  # fields per pane in the dump below; free-text name/title kept last (newline-safe)
+PANE_FIELDS = 13  # fields per pane in the dump below; free-text name/title kept last (newline-safe)
 
 
 def tmux_panes(session):
@@ -70,14 +72,14 @@ def tmux_panes(session):
     # newlines in them). Fixed groups; name and title come last.
     f = tmux("list-panes", "-s", "-t", session, "-F", "#{window_id}\n#{window_index}\n#{window_flags}\n"
              "#{window_bell_flag}\n#{pane_id}\n#{pane_active}\n#{pane_dead}\n#{pane_width}\n#{window_width}\n"
-             "#{window_activity}\n#{pane_current_command}\n#{pane_current_path}\n"
+             "#{pane_current_command}\n#{pane_current_path}\n"
              "#{window_name}\n#{pane_title}").splitlines()
     return [
         {"win": wid, "index": idx, "active": "*" in flags, "last": "-" in flags,
          "bell": bell == "1", "pane": pid, "pane_active": pa == "1", "pane_dead": dead == "1",
-         "width": int(width), "win_width": int(ww), "activity": int(activity), "command": command, "cwd": cwd,
+         "width": int(width), "win_width": int(ww), "command": command, "cwd": cwd,
          "name": name, "title": title}
-        for wid, idx, flags, bell, pid, pa, dead, width, ww, activity, command, cwd, name, title
+        for wid, idx, flags, bell, pid, pa, dead, width, ww, command, cwd, name, title
         in zip(*[iter(f)] * PANE_FIELDS)
     ]
 
@@ -100,8 +102,7 @@ def write_pane_history(pane_id, name, title, cwd, command):
     lines = [name, title, cwd, command]
     if command == "claude" and (session := claude_session_for(cwd, title)):
         lines.append(session)
-    path = HISTORY_DIR / f"tmux-tab-{pane_id.lstrip('%')}"
-    path.write_text("\n".join(lines) + "\n")
+    (HISTORY_DIR / f"tmux-tab-{pane_id.lstrip('%')}").write_text("\n".join(lines) + "\n")
 
 
 def parse_style(style):
@@ -114,9 +115,9 @@ def tmux_styles():
     return {name: parse_style(tmux("show-options", "-gv", key)) for name, key in keys.items()}
 
 
-def style_to_css(s, base=None):
-    bg = s.get("bg", base.get("bg", "default") if base else "default")
-    fg = s.get("fg", base.get("fg", "default") if base else "default")
+def style_to_css(s, base):
+    bg = s.get("bg", base.get("bg", "default"))
+    fg = s.get("fg", base.get("fg", "default"))
     if s.get("reverse"):
         bg, fg = fg, bg
     bold = "\n        text-style: bold;" if s.get("bold") else ""
@@ -153,16 +154,6 @@ CLEAR_TAG = "❌"  # last choice in the tag menu: removes the window's tag inste
 EMOJI_CHOICES = ["🚩", "⏳", "📌", "⭐", "🧊", CLEAR_TAG]  # urgent, waiting, pinned, important, stale
 
 
-def _age_str(seconds):
-    if seconds < 60:
-        return "just now"
-    if seconds < 3600:
-        return f"{seconds // 60}m ago"
-    if seconds < 86400:
-        return f"{seconds // 3600}h ago"
-    return f"{seconds // 86400}d ago"
-
-
 class WindowItem(Horizontal):
     # A window row: a clickable text label that switches to the window, plus an (X) close button that
     # appears on hover and hides 1s after the mouse leaves the row (Textual's :hover can stick when the
@@ -177,9 +168,6 @@ class WindowItem(Horizontal):
         marker = {"dead": "☠️", "bell": "🔔"}.get(win["status"], " ")
         self._icon_col = f"{marker}\n{win.get('emoji') or ' '}"  # status marker, user's tag below it
         super().__init__(classes=f"window {win['status']}".strip())
-        # tooltip's setter reaches for the screen, so it must follow super().__init__().
-        if age := win.get("activity_age"):
-            self.tooltip = f"last activity: {_age_str(age)}"
 
     def compose(self):
         yield Label(self._icon_col, classes="window-icon", markup=False)
@@ -265,6 +253,7 @@ class TmuxTabs(App):
     _pinned = None           # the clamped effective width we last pinned to; skip re-pin when unchanged
     _fifo_fd = None
     _history_seen = None    # {pane_id: (name, title)} last written to history — skip rewrite when unchanged
+    _saved_scroll = None     # #windows scroll_y carried across a recompose, see recompose()
     _bell_latch = None       # {window_id: True} bell seen since last viewed — survives tmux's index-based
                              # window_bell_flag losing track of the window across swap-window/move-window
     _emoji = None            # {window_id: emoji} user-assigned tag, right-click menu; in-memory only
@@ -315,6 +304,20 @@ class TmuxTabs(App):
         yield Vertical(*[WindowItem(w) for w in self.windows.values()], id="windows")
         yield Horizontal(Button("<history>", self.show_history), id="footer")
 
+    async def recompose(self):
+        # Recomposing remounts #windows, which resets its scroll to the top. Restore the position once
+        # the new rows are laid out (setting it earlier gets clamped to an empty container's 0).
+        # Recomposes can overlap (a switch fires several refreshes), and a later one would read the
+        # already-reset 0, so keep the first position seen until a restore has actually run.
+        if self._saved_scroll is None:
+            self._saved_scroll = self.query_one("#windows").scroll_y
+        await super().recompose()
+        self.call_after_refresh(self._restore_scroll)
+
+    def _restore_scroll(self):
+        y, self._saved_scroll = self._saved_scroll, None
+        self.query_one("#windows").scroll_to(y=y, animate=False, immediate=True)
+
     async def on_event(self, event):
         try:
             await super().on_event(event)
@@ -332,12 +335,8 @@ class TmuxTabs(App):
         if target is _APP_CLOSE:
             self.query_one("#banner").mount(ModalPrompt(
                 "close app?", lambda r: self.exit() if r == "Y" else self.cancel()))
-        else:
-            if (win := self.windows.get(target)) is None:
-                return
-            anchor = next((w for w in self.query(WindowItem) if w.win_index == target), None)
-            if not anchor:
-                return
+        elif (win := self.windows.get(target)) and (
+                anchor := next((w for w in self.query(WindowItem) if w.win_index == target), None)):
             anchor.mount(ModalPrompt(f"close {win['name']}?",
                 lambda r: self.close_window(target) if r == "Y" else self.cancel()))
 
@@ -399,8 +398,7 @@ class TmuxTabs(App):
         # Seed the fixed width to 32 chars (the width main() splits the sidebar off at — fits the
         # " tmux-tabs by gus pozuelo  (X) " banner), clamped to half the window so a narrow terminal
         # still leaves room for content, floored at 10.
-        win = int(pane_var(self._pane_id, "#{window_width}"))
-        self._width = max(10, min(32, win // 2))
+        self._width = max(10, min(32, int(pane_var(self._pane_id, "#{window_width}")) // 2))
         tmux("select-pane", "-t", self._pane_id, "-T", "(tmux-tabs)")
         self._history_seen = {}
         self._bell_latch = {}
@@ -422,12 +420,9 @@ class TmuxTabs(App):
                 tmux("kill-pane", "-t", pid)
 
     def _setup_fifo(self):
-        # No teardown on quit: the hooks are global and shared, so a dying instance must not remove
-        # them (it would break a relaunched one). We deliberately leave the FIFO in /tmp — re-created
-        # fresh on every launch below, and the OS clears /tmp in due time. See: never add on_unmount.
-        # session_id is like "$1"; strip the $ so it can't be shell-expanded inside the hook
-        session_id = pane_var(self._pane_id, "#{session_id}").lstrip("$")
-        fifo_path = f"/tmp/tmux-tabs-{session_id}"
+        # One FIFO per tmux server, named after its socket ("default", "-L" name): a FIFO has a single
+        # consumer, session ids repeat across servers, and a stable name leaves no orphans behind.
+        fifo_path = f"/tmp/tmux-tabs-{os.path.basename(os.environ['TMUX'].split(',')[0])}"
         if os.path.exists(fifo_path):
             os.unlink(fifo_path)
         os.mkfifo(fifo_path)
@@ -477,7 +472,6 @@ class TmuxTabs(App):
         # by which point _current_window is updated and the echo is filtered as "the window we're on".
         panes = tmux_panes(self._session)
         windows = _windows_from(panes)
-        now = int(time.time())
         for w in windows.values():
             # Latch bell by window_id, not index: tmux's own window_bell_flag stays attached to the
             # index slot across swap-window/move-window, so a moved window can lose its bell (or a
@@ -489,7 +483,6 @@ class TmuxTabs(App):
             if self._bell_latch.get(w["win"]) and w["status"] not in ("dead", "active"):
                 w["status"] = "bell"
             w["emoji"] = self._emoji.get(w["win"])
-            w["activity_age"] = max(0, now - w["activity"])
         self.windows = windows
         self._record_history(panes)
         mine = next((p for p in panes if p["pane"] == self._pane_id), None)
@@ -560,8 +553,7 @@ class TmuxTabs(App):
 
     def _pin_pane(self, win_index, pane, width):
         try:
-            sw = _safe_width(win_index, width)
-            tmux("set-window-option", "-t", win_index, "main-pane-width", str(sw))
+            tmux("set-window-option", "-t", win_index, "main-pane-width", str(_safe_width(win_index, width)))
             tmux("select-layout", "-t", win_index, "main-vertical", check=True)
         except subprocess.CalledProcessError:
             tmux("resize-pane", "-t", pane, "-x", str(max(1, width)))
@@ -574,8 +566,8 @@ class TmuxTabs(App):
         # -f: span the full window height on the left edge, so a multi-pane window still gets the
         # placeholder as a single leftmost column (not split off just one content pane). Width is clamped
         # window-safe (self._width may exceed a narrower target window) — see _safe_width.
-        width = _safe_width(content, width)
-        ph = tmux("split-window", "-t", content, "-fhb", "-l", str(width), "-d", "-P", "-F", "#{pane_id}", "cat")
+        ph = tmux("split-window", "-t", content, "-fhb", "-l", str(_safe_width(content, width)),
+                  "-d", "-P", "-F", "#{pane_id}", "cat")
         tmux("select-pane", "-t", ph, "-T", "(tmux-tabs)")
         return ph
 
@@ -597,9 +589,8 @@ class TmuxTabs(App):
             or self._make_placeholder(win_index, self._width)
         tmux("resize-pane", "-t", placeholder, "-x", str(_safe_width(win_index, self._width)))
         tmux("swap-pane", "-d", "-s", self._pane_id, "-t", placeholder)
-        old_panes = tmux("list-panes", "-t", self._current_window, "-F", "#{pane_id}").splitlines()
-        content = next((p for p in old_panes if p != placeholder), None)
-        if content:
+        if content := next((p for p in tmux("list-panes", "-t", self._current_window, "-F", "#{pane_id}").splitlines()
+                            if p != placeholder), None):
             tmux("select-pane", "-t", content)
         tmux("select-window", "-t", win_index)
         # Bounce the target window's own active-pane state off the placeholder we just swapped out:
@@ -627,8 +618,7 @@ class TmuxTabs(App):
 
 
 def _safe_width(win_index, width):
-    ww = int(pane_var(win_index, "#{window_width}"))
-    return max(1, min(width, ww - 1))
+    return max(1, min(width, int(pane_var(win_index, "#{window_width}")) - 1))
 
 
 def _windows_from(panes):
@@ -636,10 +626,9 @@ def _windows_from(panes):
     for p in panes:
         if (w := windows.get(p["index"])) is None:
             w = windows[p["index"]] = {"index": p["index"], "win": p["win"], "name": p["name"],
-                "bell": p["bell"], "active": p["active"], "last": p["last"], "activity": p["activity"],
+                "bell": p["bell"], "active": p["active"], "last": p["last"],
                 "content_panes": 0, "title": "", "panes": []}
         w["panes"].append(p)
-        w["activity"] = max(w["activity"], p["activity"])
         if p["title"] != "(tmux-tabs)":
             if not p["pane_dead"]:
                 w["content_panes"] += 1
@@ -657,9 +646,27 @@ def _windows_from(panes):
     return windows
 
 
+def _enable_traceback_dump():
+    # A hung sidebar shows nothing: Textual owns the terminal, so stderr is invisible and the pane
+    # just stops responding. SIGUSR1 dumps every thread's Python stack to TRACEBACK_LOG without
+    # killing the app — `kill -USR1 $(pgrep -f "tmux_tabs.py --sidebar")`, then read that file.
+    # A dump is what identifies a stall (typically an await that can never complete, e.g. awaiting
+    # the removal of the very widget whose handler is running); guessing at one costs far more.
+    TRACEBACK_LOG.parent.mkdir(parents=True, exist_ok=True)
+    # The stream stays open for the process lifetime by design: faulthandler writes to its fd from a
+    # signal handler, which cannot open or allocate anything at dump time.
+    stream = TRACEBACK_LOG.open("a", buffering=1)
+    faulthandler.enable(file=stream)  # also dumps on a hard crash (segfault, abort)
+    # chain=False, NOT True: chaining runs SIGUSR1's default action after the dump, which with no
+    # previous handler installed kills the process (verified: exits -10 on the first signal). We want
+    # to inspect a running sidebar and signal it repeatedly, so the default action must be suppressed.
+    faulthandler.register(signal.SIGUSR1, file=stream, all_threads=True, chain=False)
+
+
 def main():
     if "--sidebar" in sys.argv:
         os.environ.setdefault("TEXTUAL_THEME", "")
+        _enable_traceback_dump()
         TmuxTabs.CSS = TmuxTabs.build_css()
         TmuxTabs().run(inline=False)
         return

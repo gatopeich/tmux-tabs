@@ -44,12 +44,6 @@ It splits off a 25%-wide sidebar on the left and hands your original pane back a
 
 To quit: click the `(X)` button, then `(Y)` to confirm.
 
-Optionally bind it to a key in `~/.tmux.conf`:
-
-```tmux
-bind -n F9 run-shell tmux-tabs
-```
-
 ## How it works
 
 `tmux-tabs` is a single Textual app. A bare launch splits off the sidebar pane and re-invokes itself
